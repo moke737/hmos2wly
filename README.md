@@ -223,7 +223,13 @@ If this saved you some time, you can buy the author a coffee (WeChat Pay):
 
 <img src="docs/donate-wechat.png" alt="WeChat reward QR" width="280">
 
-## 8. Credits & license
+## 8. Full engineering log
+
+The complete measurement record (boot-chain analysis, the 30-patch device matrix,
+the M0-M7 plan, every kernel bisection, and the dead ends) is in
+[docs/FINDINGS.md](docs/FINDINGS.md) - written in Chinese, as it was kept day by day.
+
+## 9. Credits & license
 
 * Architecture and the preinit idea: [hmos2sweet](https://github.com/tsryzenstech/hmos2sweet)
 * HarmonyOS 5 images: Huawei `update_full_base.zip` (Pura 70, `ADY-AL10`)
