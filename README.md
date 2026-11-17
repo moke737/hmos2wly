@@ -219,7 +219,7 @@ Conclusions:
 
 ## 7. Support
 
-If this saved you some time, you can buy the author a coffee (WeChat Pay):
+If this saved you some time, you can buy the author a coffee:
 
 <img src="docs/donate-wechat.png" alt="WeChat reward QR" width="280">
 
