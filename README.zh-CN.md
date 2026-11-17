@@ -211,7 +211,12 @@ magic，且要用**内核版 CRC32**：不做最终取反）。
 
 <img src="docs/donate-wechat.png" alt="微信赞赏码" width="280">
 
-## 8. 致谢与许可
+## 8. 完整工程日志
+
+逐日的完整实测记录（启动链分析、30 个设备补丁矩阵、M0–M7 计划、每一次内核二分、所有死路）在
+[docs/FINDINGS.md](docs/FINDINGS.md)。
+
+## 9. 致谢与许可
 
 * 架构与 preinit 思路：[hmos2sweet](https://github.com/tsryzenstech/hmos2sweet)
 * 鸿蒙 5 镜像：华为 `update_full_base.zip`（Pura 70，`ADY-AL10`）
