@@ -513,3 +513,63 @@ pad | 绗簩浠?bootconfig 鏂囨湰 | pad(0x2000) | AVB vbmeta | 鈥?| AVB f
 
 
 
+
+---
+
+## Appendix A - 2026-11-18, further kernel bisection and prior art
+
+### A.1 Built-in vs modular matters, and it is not the clocks
+
+| image | SMMU | result |
+|---|---|---|
+| v12 | **module** + `iommu.passthrough=1` | boots, `/init` runs |
+| v36/v37 | **built-in** + `iommu.passthrough=1` | stuck at the boot logo |
+
+Same driver, same cmdline - only the initcall timing differs. So the hang is an
+*early built-in probe*, not the clock values themselves.
+
+Configurations that all hung (stuck at logo or ABL's 2-minute timeout):
+
+* `rpmhpd` as a module (v27) and built in (v28, v29)
+* `gcc-waipio` as a module (v26) and built in (v36)
+* the OEM's own 18 modules with their vermagic rewritten (v30) - the kernel has
+  `CONFIG_MODVERSIONS=y`, so the CRCs are checked anyway; building with
+  MODVERSIONS=n avoided that but the modules then hung as well
+* LineageOS tree + `gki_defconfig` + `waipio_GKI.config` (v33)
+* LineageOS tree + `gki_defconfig` + `waipio_consolidate.config` (v35, 1882 built-ins)
+
+### A.2 `vendor_boot` cannot be modified even with a re-signed footer
+
+The internal AVB hash descriptor covers the vendor ramdisk. Replacing it with a
+footer signed by a test key (`avbtool add_hash_footer`, SHA256_RSA2048) is still
+rejected: OnePlus ABL verifies against the OEM key. `boot.img` on the other hand
+is accepted with `vbmeta` flags=3, which is why a self-built kernel is the only
+route.
+
+### A.3 Prior art that changes the plan
+
+* [OpenHarmony rich-device porting guide (Diemit, Xiaomi 6 / SDM835)](https://ost.51cto.com/posts/20849)
+  - he did **not** build a kernel from scratch; he used the vendor's own kernel
+    source plus the vendor build scripts, then applied OpenHarmony patches.
+    His `boot.img` cmdline contains three things worth copying:
+    `clk_ignore_unused`, `default_boot_device=<ufshc node>` and
+    `ohos.required_mount.<name>=<dev>@<mountpoint>@<fstype>@<options>@<flags>`
+    (the last one removes the need for our `/etc/fstab.required`).
+    `clk_ignore_unused` did **not** fix our hang (v37), but the other two are
+    still useful.
+* [OpenHarmony kernel patch set for 5.10](https://gitee.com/openharmony/kernel_linux_patches)
+  (`linux-5.10/common_patch/hdf.patch` + per-SoC patches) and the corresponding
+  kernel tree `kernel_linux_5.10`, which carries the access_token / binder
+  extensions.
+* [HarmonyOS 4 GSI for Qualcomm devices](https://www.coolapk.com/feed/48816701)
+  exists but is explicitly a toy: brightness, camera, calls and fingerprint are
+  broken, and it still needs kernel work ("华为的开源内核魔改严重").
+
+### A.4 Conclusion
+
+The remaining credible path is to reproduce the vendor's *build system* rather
+than the config: AOSP kernel prebuilts (clang-r416183b), `build.config.msm.waipio`,
+LTO+CFI enabled, the vendor's DTB - verify that this boots, then apply the
+OpenHarmony patches (HDF + access_token/binder). Every ad-hoc `make` build we
+tried loses to a driver probing too early, and LTO+CFI+the OEM toolchain is the
+one variable never matched.
