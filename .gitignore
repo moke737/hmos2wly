@@ -1,0 +1,14 @@
+﻿# build outputs
+*.img
+*.bin
+*.ko
+*.o
+*.dtb
+*.cpio
+*.lz4
+__pycache__/
+*.pyc
+
+# local notes
+notes/
+logs/
