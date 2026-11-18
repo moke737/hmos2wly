@@ -778,3 +778,29 @@ modules.  Two viable routes therefore exist:
 1. build the vendor modules ourselves (`make M=vendor/qcom/opensource/...` against
    our kernel) and ship them in `/ohos-modules` inside our ramdisk, or
 2. fetch `msm-kernel` so the platform module build works.
+### C.4 Why "impersonating" the stock kernel does not work
+
+Attempt: build a GKI-shaped kernel whose `UTS_RELEASE` is forced to the stock
+string (`scripts/setlocalversion` made to print `-gki-g0b92723d0f5a`), keep
+`CONFIG_MODVERSIONS=y` so the vermagic matches byte for byte, and patch
+`check_version()` in `kernel/module.c` to `return 0` so the symbol CRCs are not
+compared.  Then the stock vendor modules should load.
+
+Measured result:
+
+* the self-built kernel boots (verified with the minimal logger ramdisk: powers
+  off after ~14 s);
+* but booting it with the OpenHarmony ramdisk - which loads the stock modules -
+  resets after ~12 s and our init never reaches its first log line.
+
+The reason is that skipping the CRC check only bypasses the *detection* of an ABI
+mismatch: the stock modules are compiled against the stock configuration, and our
+kernel's configuration differs (struct layouts, lockdep, etc.).  Loading them
+corrupts the kernel instead of failing cleanly.
+
+Conclusion: the vendor drivers must be built **from source against our own
+kernel** - `gcc-waipio`, `phy-qcom-ufs-qmp-v4-waipio`, `icc-rpmh`,
+`rpmh-regulator`, `pinctrl-waipio`.  They live in Qualcomm's `msm-5.10` tree
+(reachable at `git.codelinaro.org/clo/la/kernel/msm-5.10`, tags
+`KERNEL.PLATFORM.1.0.r1-*` / `1.1.r1-*`), which is the missing
+`kernel_platform/msm-kernel` that `build.config.msm.waipio` points at.
