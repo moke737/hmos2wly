@@ -573,3 +573,93 @@ LTO+CFI enabled, the vendor's DTB - verify that this boots, then apply the
 OpenHarmony patches (HDF + access_token/binder). Every ad-hoc `make` build we
 tried loses to a driver probing too early, and LTO+CFI+the OEM toolchain is the
 one variable never matched.
+---
+
+## Appendix B - 2026-11-18 evening: OpenHarmony's init really runs on the phone
+
+This session took the port from "partitions exist" to "HarmonyOS init executes on
+real hardware".  Everything below is measured on the NE2210, not inferred.
+
+### B.1 The winning boot chain
+
+`boot.img` = **stock OnePlus kernel (gzip, untouched)** + **HarmonyOS ramdisk**
+(the 6.5 MB tree from the Pura-70 ramdisk) + **our own `/init`**.
+
+`vendor_boot_a` stays stock: the stock vendor ramdisk is merged by the kernel and
+supplies `/lib/modules` (144 modules) to whatever ramdisk boots.  `boot.img` is
+the only modifiable piece - ABL rejects any modified `vendor_boot` even when its
+AVB footer is re-signed with a test key.
+
+Boot sequence that works:
+
+1. `/init` mounts proc/sys/dev(tmpfs)/tmp
+2. loads `/lib/modules/modules.load` in **multi-pass** fashion (dependencies
+   resolve over repeated passes; single pass leaves 65 of 144 unloaded)
+3. waits for block devices (UFS probes asynchronously; 131 appear)
+4. creates `/dev/mapper/control` and `/dev/device-mapper` (both `c 10:236`) -
+   **without these every dm ioctl fails silently and zero partitions get mapped**
+5. parses the super LP metadata and creates dm-linear mappings
+6. creates `/dev/block/dm-N` nodes **after** mapping (`uevent` scan)
+7. mounts `dm-0` (the HarmonyOS `system` partition, erofs) at `/usr`
+8. makes `/usr/system` reachable as `/system` (early symlink works; bind mount
+   returns E2BIG on this kernel)
+9. mounts tmpfs on `/data`, `/dev/pts`, `/dev/shm`
+10. `exec /system/bin/init`
+
+### B.2 Layout facts (these cost hours)
+
+* the HarmonyOS `system` image is mounted at **`/usr`**;
+* its top level is a symlink farm (`bin -> /system/bin`, `init -> /system/bin/init`)
+  and the real tree lives in its **`system/` sub-directory**;
+* therefore `/system` must resolve to **`/usr/system`**;
+* `/system/bin/init` is 456 KB, dynamically linked against
+  `/system/lib/ld-musl-aarch64.so.1`.
+
+### B.3 Proof that HarmonyOS init executes
+
+Forked child (PID != 1) running `/system/bin/init`:
+
+```
+child pid=245
+child alive at 5s
+child exited (status 0x0) at 10s
+```
+
+As PID 1 it starts and keeps running, but the phone resets after ~80 s.  Feeding
+the Qualcomm watchdog (persistent fd, pings every 5 s) does **not** change that,
+so the reset is a **kernel panic**, not the watchdog: OpenHarmony's init reaches
+code that needs OpenHarmony kernel features (the tokenid / access_token driver is
+the usual first one) and the stock kernel has none of them.
+
+### B.4 Debug channel without UART, display or adb
+
+`logdump` partition, raw, no filesystem needed:
+
+```c
+/* open /dev/block/<logdump>, pwrite 256-byte slots at 4096 + n*256 */
+```
+
+Read it back from TWRP:
+
+```sh
+dd if=/dev/block/by-name/logdump bs=4096 skip=1 count=24 | strings
+```
+
+This turned every ambiguous "stuck at logo" into an exact answer and is the
+single most useful tool of the session.
+
+### B.5 Two bugs worth remembering
+
+* dm minors start at **0**, so `if (!system_minor)` treats a valid dm-0 as
+  "not found" - keep a separate `have_system` flag;
+* the device nodes for dm devices must be created **after** the mappings exist,
+  otherwise `mount("/dev/block/dm-0")` fails with ENOENT.
+
+### B.6 What is left
+
+The userspace side of M0b is done; the remaining blocker is the kernel.  The
+stock kernel cannot be patched and every self-built kernel either lacks UFS or
+freezes on early probe, so OpenHarmony's kernel features (access_token/tokenid,
+binder extensions, hmdfs) cannot be added yet.  The next milestone is a
+self-built kernel that boots *and* has UFS, i.e. reproducing the vendor build
+system (clang-r416183b, `build.config.msm.waipio`, LTO+CFI) - see Appendix A.4.
