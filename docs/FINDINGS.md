@@ -1077,3 +1077,37 @@ So the standalone route is a finite symbol-chasing exercise (~4 minutes per roun
 and was left at the QMP symbols.  It is the most promising way to a kernel with UFS
 built in, and therefore to a boot in which every driver comes up in kernel order -
 the way the Xiaomi 6 port works.
+### F.5 The standalone kernel builds, but the full vendor config does not boot
+
+`msm-kernel` configured standalone and built with the vendor's
+`waipio-consolidate_defconfig` links successfully (~4 minutes, no LTO):
+
+```
+Image 36 MB
+CONFIG_SCSI_UFS_QCOM=y   CONFIG_MSM_GCC_WAIPIO=y   CONFIG_QCOM_RPMHPD=y
+vermagic 5.10.233-qki-consolidate-dirty
+```
+
+But it resets after ~12 s **even with the minimal v6 logger ramdisk**, i.e. the
+kernel dies during its own init - before userspace.  The consolidate config builds
+hundreds of vendor drivers in, and at least one of them faults during probe.  This
+is the same wall the all-built-in GKI attempt hit at the very beginning.
+
+**The fix is to reduce the config, not to add more.**  The plan for the next
+session:
+
+1. take the **GKI config that is known to boot** (`common/arch/arm64/configs/gki_defconfig`)
+   as the base for the standalone `msm-kernel` build;
+2. enable **only** the UFS chain on top of it:
+   `QCOM_SCM, QCOM_SMEM, QCOM_COMMAND_DB, QCOM_RPMH, QCOM_RPMHPD, QCOM_CLK_RPMH,
+   REGULATOR_RPMH, COMMON_CLK_QCOM, MSM_GCC_WAIPIO, SCSI_UFS_QCOM, SCSI_UFSHCD,
+   PHY_QCOM_UFS, PHY_QCOM_UFS_V4` (+ the helper configs found in F.4:
+   `QTI_IOMMU_SUPPORT, QCOM_SECURE_BUFFER, REGULATOR_DEBUG_CONTROL,
+   REGULATOR_PROXY_CONSUMER, QCOM_GDSC_REGULATOR, SCSI_UFS_CRYPTO_QTI,
+   QTI_CRYPTO_COMMON, QTI_HW_KEY_MANAGER, IPC_LOGGING, QCOM_MINIDUMP,
+   QCOM_AOSS_QMP, MSM_TMECOM_QMP, IOMMU_IO_PGTABLE_FAST, QCOM_GDSC`);
+3. build, flash with the minimal ramdisk, and only then add the OpenHarmony
+   ramdisk.
+
+That gives a kernel whose init path is as close as possible to the one that already
+boots, plus exactly the storage stack.
