@@ -967,3 +967,43 @@ build in is probably only the UFS chain
 (`QCOM_RPMH, QCOM_RPMHPD, QCOM_CLK_RPMH, REGULATOR_RPMH, MSM_GCC_WAIPIO,
 SCSI_UFS_QCOM, PHY_QCOM_UFS, PHY_QCOM_UFS_V4`) while leaving `PINCTRL_MSM`,
 `QCOM_SCM`, `ARM_SMMU` and `INTERCONNECT_QCOM*` as modules.
+### E.7 Path A is architecturally impossible: this is a GKI 2.0 mixed build
+
+Attempting to build the UFS chain into the kernel never converges, and the reason
+turned out to be structural rather than a config mistake.  In the build output:
+
+```
+out/msm-waipio-waipio-consolidate/
+    gki_kernel/common/Module.symvers     <- the GKI kernel is built here
+    msm-kernel/drivers/...               <- no vmlinux, no .o files
+```
+
+`msm-kernel` is compiled as an **external module set against the prebuilt GKI
+kernel**.  Every vendor driver - `ufs_qcom`, `gcc-waipio`, `rpmhpd`,
+`phy-qcom-ufs`, `icc-rpmh`, `pinctrl-waipio` - can only ever be a module in this
+platform.  That is also why each `=y` in a fragment is silently forced back:
+
+```
+ERROR! Defconfig fragment did not apply as expected
+  QCOM_RPMH y -> m
+  SCSI_UFS_QCOM y -> m
+```
+
+`IOMMU_IO_PGTABLE_FAST` and `QCOM_GDSC` are `bool`, so `=m` is rejected for them
+(they must be `=y`), and a tristate can only be `=y` when its whole dependency
+chain is `=y` - which GKI forbids for vendor code.
+
+**Conclusion: path A is dead.  Loading the vendor modules at boot is the only
+route on this platform**, so the work has to go into making module loading
+survive: the panics are in individual drivers' probe paths, and the two confirmed
+ones (`iommu-logger`, `qcom_glink`) are both dispensable for storage.
+
+### E.8 Practical bisect recipe for the next session
+
+1. take `m0b/rd_order_v2.txt` (83 modules, `iommu-logger` and the glink family
+   already removed);
+2. build prefix images with `m0b/build_v34.sh <N>` (the init reports
+   `10 + n_ok` through the power-off delay);
+3. a reset means the culprit is inside the first N; a clean power-off means it is
+   later - four or five boots identify it;
+4. exclude it and repeat.
