@@ -873,3 +873,50 @@ path; if it resets too, the platform kernel itself is the problem.
 for diagnosing storage bring-up.  Use the power-off delay encoding instead
 (`sleep(10 + value); reboot(RB_POWER_OFF)`), which needs nothing but a working
 kernel.
+---
+
+## Appendix E - 2026-11-19 early morning: the observability wall
+
+### E.1 What was established tonight
+
+* the full OnePlus/Qualcomm platform build works (Appendix D): `Image` + 668 modules;
+* that `Image` **boots** - with the minimal logger ramdisk it powers off after
+  12-15 s, exactly like the GKI build;
+* module loading from `/ohos-modules` works in principle: loading only
+  `smem.ko` produced a clean power-off (delay encoding confirmed it);
+* **`qcom_glink.ko` panics the kernel** - bisected over the ordered list:
+  `smem` OK, `smem+qcom_smd+minidump+qcom_ipc_logging` OK, adding
+  `qcom_glink` resets.  GLINK's probe talks to a remoteproc that is not up in an
+  initramfs-only boot.
+* **but the rest of the pipeline still panics even when the module set is
+  emptied** - with module loading stubbed out the kernel still resets, and since
+  PID 1 dying panics the kernel by definition, every fault in `/init` is fatal and
+  invisible.
+
+### E.2 The observability wall
+
+Diagnosing that needs a log channel, and every candidate is blocked:
+
+| channel | why it fails |
+|---|---|
+| `logdump` partition | needs UFS, which is exactly what we are debugging |
+| `pstore`/ramoops | the DTB node uses dynamic `alloc-ranges`, and reading it requires a later boot that can write somewhere anyway |
+| USB serial console | the kernel has `CONFIG_USB_CONFIGFS(_SERIAL)=y` and the Image contains `ttyGS`, but `dwc3-msm` needs the GLINK/PMIC role-switch path - and `qcom_glink` is the module that panics |
+| visible LEDs / backlight | both are provided by modules that are not up that early |
+
+### E.3 Two ways out
+
+1. **A supervisor `/init`** (implemented, `m0b/supervisor.c`): PID 1 only mounts
+   proc/sys/dev, forks `/realinit`, polls a `/stage` file and, if the child dies,
+   encodes the last stage in the power-off delay (`10 + stage`).  A crash in the
+   worker no longer panics the kernel, so the stage becomes readable.  The image
+   was built but not yet tested when the session ended.
+2. **Make GLINK survive**: the panic is in its probe; loading `qcom_glink` after
+   the remoteproc/aoss pieces (or patching the driver to defer when the SMEM host
+   is absent) would restore the USB gadget and with it a real console.
+
+### E.4 Lesson worth keeping
+
+For bring-up work the order of value is: **serial console > USB gadget console >
+raw partition logging > timing codes**.  Building the console first would have
+saved most of this session.
