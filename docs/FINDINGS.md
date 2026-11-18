@@ -697,3 +697,84 @@ nor `logdump` (512 MB, no kernel data) receives the dump on this device.
 2. Build the missing interfaces into a kernel we can boot: reproduce the vendor
    build system (clang-r416183b, `build.config.msm.waipio`, LTO+CFI) so UFS comes
    up in a self-built kernel, then apply the OpenHarmony patches.
+---
+
+## Appendix C - 2026-11-18 late: we can now build a kernel that boots
+
+### C.1 The vendor build recipe, recovered from a prebuilt kernel
+
+A working third-party kernel for this exact device exists
+([WildKernels/OnePlus_KernelSU_SUSFS](https://github.com/WildKernels/OnePlus_KernelSU_SUSFS)).
+Its `Image` reports:
+
+```
+Linux version 5.10.236-android12-OP-WILD (OnePlus@ubuntu-build)
+(Android (7416131, based on r416183c) clang version 12.0.6, LLD 12.0.6)
+```
+
+`configs/a16/OP10pro.json` + `manifests/a16/oneplus_10_pro_w.xml` in that repo give
+the complete recipe:
+
+| piece | source |
+|---|---|
+| kernel | `OnePlusOSS/android_kernel_common_oneplus_sm8450` @ `oneplus/sm8450_b_16.0_oneplus_10_pro` |
+| modules + devicetree | `OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8450` @ same branch |
+| toolchain | `git.codelinaro.org/clo/la/kernelplatform/prebuilts-master/clang/host/linux-x86` (`clang-r416183c`) |
+| build tools | `git.codelinaro.org/clo/la/kernel/prebuilts/build-tools` |
+
+Build environment that worked:
+
+```sh
+export LLVM=1 LLVM_IAS=1 ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+export LD=ld.lld HOSTLD=ld.lld AR=llvm-ar NM=llvm-nm
+export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+# ld-wrapper: ld.lld "$@" --thinlto-jobs=$(nproc)
+make LD=$PWD/ld-wrapper HOSTLD=$PWD/ld-wrapper O=out gki_defconfig
+make LD=$PWD/ld-wrapper HOSTLD=$PWD/ld-wrapper O=out olddefconfig
+make LD=$PWD/ld-wrapper HOSTLD=$PWD/ld-wrapper -j$(nproc) O=out Image modules
+```
+
+Two pitfalls worth remembering:
+
+* `LD` must be an **absolute** path (`./ld-wrapper` is resolved inside `out/` and
+  the kconfig step then fails with "linker './ld-wrapper' not found");
+* the build scripts call `python`, not `python3` - create the symlink.
+
+With **clang-r416183c** `CONFIG_LTO_CLANG_THIN=y` is finally accepted; with the
+distribution clang 18 the same switch is silently dropped to `CONFIG_LTO_NONE`.
+
+Tree layout matters: the kernel must sit in `kernel_platform/common` with
+`vendor/` at the checkout root, because the tree is full of relative symlinks
+(`common/kernel/oplus_cpu -> ../../../vendor/oplus/kernel/cpu`).
+
+### C.2 Result: a self-built kernel boots on the phone
+
+`Image` (39.6 MB, LTO thin, 68 modules) + the minimal v6 logger ramdisk:
+
+```
+~12 s -> screen off, i.e. /init ran and powered the device off
+```
+
+So the self-built kernel boots.  This is the piece that blocked everything: from
+now on the kernel can be patched freely, which is what OpenHarmony's kernel
+features (tokenid/access_token, binder extensions) require.
+
+### C.3 Still missing: the vendor clock/PHY/interconnect modules
+
+`CONFIG_SCSI_UFS_QCOM=m` builds and its vermagic matches our kernel, but the UFS
+probe also needs `gcc-waipio`, `phy-qcom-ufs-qmp-v4-waipio`, `icc-rpmh` and
+`rpmh-regulator`, which are **not** built by `gki_defconfig` + the waipio fragment
+(`MSM_GCC_WAIPIO`, `PHY_QCOM_UFS`, `PINCTRL_WAIPIO`, `INTERCONNECT_QCOM_WAIPIO`
+all end up unset).  They come from the vendor tree and are built by the platform
+module build, which needs `kernel_platform/msm-kernel` - the symlink
+`build.config.msm.waipio -> ../msm-kernel/build.config.msm.waipio` dangles in our
+checkout, and that repository is not in the manifest.
+
+Note for the next attempt: the WildKernels kernel is **GKI only** (its embedded
+config has `# CONFIG_SCSI_UFS_QCOM is not set` and no vendor drivers at all); it
+works on devices because it keeps `CONFIG_LOCALVERSION` compatible with the stock
+modules.  Two viable routes therefore exist:
+
+1. build the vendor modules ourselves (`make M=vendor/qcom/opensource/...` against
+   our kernel) and ship them in `/ohos-modules` inside our ramdisk, or
+2. fetch `msm-kernel` so the platform module build works.
