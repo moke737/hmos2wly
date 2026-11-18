@@ -1111,3 +1111,36 @@ session:
 
 That gives a kernel whose init path is as close as possible to the one that already
 boots, plus exactly the storage stack.
+### F.6 Empirical rule: no vendor driver may be built in
+
+Three kernels were produced tonight and tested on the device:
+
+| kernel | vendor drivers | boots? |
+|---|---|---|
+| GKI only (platform build, `common` config) | none | **yes** |
+| GKI base + UFS chain built in (`out-gki`, 31 MB) | 30 symbols | **no** |
+| full vendor consolidate build (`out-alone`, 36 MB) | hundreds | **no** |
+| WildKernels prebuilt (third-party, 44 MB) | none | **yes** |
+
+Every configuration that contains vendor driver code fails to reach userspace, and
+that includes a build with only ~30 vendor symbols.  The third-party kernel that
+does work on this device is also pure GKI, and it relies on the stock modules.
+
+So the direction is settled: **the kernel that boots is the GKI one, and the vendor
+drivers have to arrive as the stock modules** - which is exactly the configuration
+where we already measured 131 block devices on the phone.  The only remaining
+problem on that path is that *our* loader trips over two of the 144 modules
+(`iommu-logger`, `qcom_glink`, both confirmed by bisect); the rest never got tested
+because the bisect stopped there.
+
+### F.7 Plan for the next session (shortest path to a working boot)
+
+1. flash the platform-built GKI kernel (the one that boots) with the OpenHarmony
+   ramdisk;
+2. use `m0b/rd_order_v2.txt` (83 modules, the two known crashers removed) and
+   bisect with `m0b/build_v34.sh <N>` / the power-off delay - 4 or 5 boots;
+3. with the crashy modules excluded, UFS comes up, the partitions map and
+   HarmonyOS init is reached - the state we already proved is reachable, just with
+   a stable module set this time;
+4. only then think about kernel patches (OpenHarmony's tokenid/binder), which will
+   need a custom kernel anyway - but by then the userspace side will be complete.
