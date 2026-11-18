@@ -920,3 +920,50 @@ Diagnosing that needs a log channel, and every candidate is blocked:
 For bring-up work the order of value is: **serial console > USB gadget console >
 raw partition logging > timing codes**.  Building the console first would have
 saved most of this session.
+### E.5 Bisect results (module set)
+
+Loading the vendor modules one by one into the platform kernel, using the power-off
+delay to report (`10 + n_ok`), produced a clear chain:
+
+| modules loaded | result |
+|---|---|
+| `smem` alone | power off, clean |
+| `smem, qcom_smd, minidump, qcom_ipc_logging` | power off at ~14 s, clean |
+| + `iommu-logger` | **kernel panic** |
+| + `qcom_glink` (earlier list) | **kernel panic** |
+
+So `iommu-logger.ko` and `qcom_glink.ko` both panic this kernel during probe.
+Neither is needed for UFS, so both are excluded (`m0b/rd_order_v2.txt`).
+
+Important: these panics are **kernel-level**, which is why the supervisor design
+(`m0b/supervisor.c`, PID 1 supervises a child) does not help - a panic takes the
+whole machine down regardless of which process triggered it.  The supervisor only
+protects against userspace faults.
+
+### E.6 Built-in storage stack: the export problem
+
+The other way to avoid the fragile module loader is to build the storage stack
+into the kernel.  Flipping the vendor fragments (`waipio_GKI.config`,
+`waipio_consolidate.config`) from `=m` to `=y` for
+`QCOM_RPMH, QCOM_RPMHPD, QCOM_CLK_RPMH, REGULATOR_RPMH, MSM_GCC_WAIPIO,
+SCSI_UFS_QCOM, PHY_QCOM_UFS(_V4), PINCTRL_*, INTERCONNECT_QCOM(_WAIPIO),
+ARM_SMMU, QCOM_SCM, COMMON_CLK_QCOM` runs into two hard requirements:
+
+1. a tristate can only be `=y` when **all its dependencies are `=y`** - the build
+   reports `Defconfig fragment did not apply as expected: X y -> m` and stops, so
+   the whole parent chain has to be flipped too (`QCOM_GLINK` cannot be built in
+   at all, its dependency stays modular);
+2. once a driver is built in, its symbols are **no longer exported to modules**,
+   so every remaining module that uses them fails modpost:
+
+```
+ERROR: modpost: "msm_pinctrl_probe" [drivers/pinctrl/qcom/pinctrl-cape.ko] undefined!
+ERROR: modpost: "qcom_scm_io_writel" [drivers/irqchip/qcom-pdc.ko] undefined!
+```
+
+The fix is either `EXPORT_SYMBOL()` on those helpers, or keeping exactly the
+subsystems modular that other modules link against.  The narrowest useful set to
+build in is probably only the UFS chain
+(`QCOM_RPMH, QCOM_RPMHPD, QCOM_CLK_RPMH, REGULATOR_RPMH, MSM_GCC_WAIPIO,
+SCSI_UFS_QCOM, PHY_QCOM_UFS, PHY_QCOM_UFS_V4`) while leaving `PINCTRL_MSM`,
+`QCOM_SCM`, `ARM_SMMU` and `INTERCONNECT_QCOM*` as modules.
