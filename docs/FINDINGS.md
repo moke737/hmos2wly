@@ -1007,3 +1007,73 @@ ones (`iommu-logger`, `qcom_glink`) are both dispensable for storage.
 3. a reset means the culprit is inside the first N; a clean power-off means it is
    later - four or five boots identify it;
 4. exclude it and repeat.
+---
+
+## Appendix F - 2026-11-19: how the known-good ports actually do it
+
+Studied the Xiaomi 6 / SDM835 port again
+([Diemit's porting guide](https://ost.51cto.com/posts/20849),
+[packaging and debugging article](https://m.elecfans.com/article/2012725.html)).
+Three details matter for us:
+
+### F.1 They build every driver INTO the kernel
+
+> "我们的内核因为把模块编译进内核的缘故，容量会增大" - boot.img grows from 8 MB to
+> 16 MB because all modules are compiled in.
+
+That is only possible because the Xiaomi 6 kernel is a classic non-GKI tree.  Our
+platform is GKI 2.0 (`msm-kernel` is an external module set), which is exactly why
+the built-in attempt failed (Appendix E).
+
+**But `msm-kernel` itself is a complete kernel tree**, and it can be configured
+standalone:
+
+```sh
+cd kernel_platform/msm-kernel
+make O=out-alone ARCH=arm64 vendor/waipio-consolidate_defconfig
+# force CONFIG_SCSI_UFS_QCOM / MSM_GCC_WAIPIO / QCOM_RPMHPD / ARM_SMMU ... = y
+make O=out-alone ARCH=arm64 Image
+```
+
+Standalone, `=y` sticks - a kernel with UFS built in is genuinely possible, which
+would remove the fragile module loader from the boot path entirely.
+
+### F.2 The cmdline carries the mounts for HarmonyOS
+
+```
+ohos.required_mount.system=/dev/block/.../by-name/system@/usr@ext4@ro,barrier=1@wait,required
+ohos.required_mount.vendor=/dev/block/.../by-name/cust@/vendor@ext4@...
+```
+
+HarmonyOS init reads these and mounts by itself - no `/etc/fstab.required` needed.
+Since `boot.img` is the one image we can modify, this is available to us and is
+simpler than the fstab route we currently use.
+
+### F.3 They use a USB serial console as the debug channel
+
+`console=ttyGS0,115200` in the cmdline, then "如果内核驱动正常的话手机使用 usb 连接
+电脑会自动识别为 com 设备" - the phone shows up as a COM port.  We have all the
+gadget support built in (`CONFIG_USB_CONFIGFS_SERIAL=y`, `ttyGS` in the image);
+what was missing is `dwc3-msm`, whose probe needs the GLINK/PMIC role switch.
+
+### F.4 Where the standalone build stands
+
+Without LTO (the thin-LTO link needs more than this machine's 9.7 GB of RAM and
+thrashes swap) the standalone kernel compiles and links in ~4 minutes per
+iteration.  Progressively fixing undefined symbols found at link time:
+
+| symbol | fix |
+|---|---|
+| `gdsc_debug_print_regs` | `QCOM_GDSC_REGULATOR=y` |
+| `ufshcd_qti_hba_init_crypto_capabilities`, `crypto_qti_disable` | `SCSI_UFS_CRYPTO_QTI=y`, `QTI_CRYPTO_COMMON=y`, then `QTI_HW_KEY_MANAGER=y` (its `crypto_qti_*_platform` live in `crypto-qti-hwkm.c`; `QTI_CRYPTO_TZ` is the alternative implementation and must stay off or the symbols collide) |
+| `devm_regulator_debug_register`, `regulator_proxy_consumer_sync_state` | `REGULATOR_DEBUG_CONTROL=y`, `REGULATOR_PROXY_CONSUMER=y` |
+| `iommu_logger_register` | `QTI_IOMMU_SUPPORT=y` |
+| `hyp_assign_phys` | `QCOM_SECURE_BUFFER=y` |
+| `ipc_log_string`, `ipc_log_context_create` | `CONFIG_IPC_LOGGING=y` (implementation is `kernel/trace/ipc_logging.c` in this tree, not `drivers/soc/qcom/`) |
+| `tme_hwkm_master_broadcast_transportkey` | comes from `tmecom`, which needs the QTI QMP mailbox driver that this tree lacks - stub it, or leave `MSM_TMECOM_QMP` off |
+| `qmp_get`, `qmp_send` | still unresolved; another built-in driver uses QMP and the provider is not in this tree |
+
+So the standalone route is a finite symbol-chasing exercise (~4 minutes per round)
+and was left at the QMP symbols.  It is the most promising way to a kernel with UFS
+built in, and therefore to a boot in which every driver comes up in kernel order -
+the way the Xiaomi 6 port works.
