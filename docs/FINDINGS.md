@@ -804,3 +804,72 @@ kernel** - `gcc-waipio`, `phy-qcom-ufs-qmp-v4-waipio`, `icc-rpmh`,
 (reachable at `git.codelinaro.org/clo/la/kernel/msm-5.10`, tags
 `KERNEL.PLATFORM.1.0.r1-*` / `1.1.r1-*`), which is the missing
 `kernel_platform/msm-kernel` that `build.config.msm.waipio` points at.
+---
+
+## Appendix D - 2026-11-18 late: the full vendor platform build works
+
+The missing piece from Appendix C was Qualcomm's own kernel tree.  It is public:
+
+```
+git clone --depth 1 -b KERNEL.PLATFORM.1.0.c25 \
+  https://git.codelinaro.org/clo/la/kernel/msm-5.10  kernel_platform/msm-kernel
+```
+
+With it in place, OnePlus's own platform build runs:
+
+```sh
+cd kernel_platform
+BUILD_CONFIG=msm-kernel/build.config.msm.waipio ./build/build.sh
+```
+
+### D.1 What had to be fixed to make the platform build run on a plain Ubuntu
+
+| problem | fix |
+|---|---|
+| `_setup_env.sh` replaces PATH with only the prebuilt host tools (`nproc`, `sed`, `readlink` disappear) | append `:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` to that PATH assignment |
+| host compiles cannot find `sys/types.h` | point `build/build-tools/sysroot` at `/` |
+| `bison`/`flex` wrappers point at a prebuilt that is not fetched | symlink the wrappers to `/usr/bin/bison`, `/usr/bin/flex`, `/usr/bin/m4` |
+| `external/dtc` missing | shim Makefile that installs the **system** `dtc` (the prebuilt dtc needs `libfdt.so`) |
+| ABI sanity check aborts on `abi_gki_aarch64.xml` mismatch | early `return 0` in `sanity_check_abi()` (`msm-kernel/build.config.msm.gki`) |
+| `clang-r416183b` expected | symlink it to the fetched `clang-r416183c` |
+
+### D.2 Result
+
+```
+out/msm-waipio-waipio-consolidate/dist/Image      56.8 MB   (full vendor kernel)
+out/.../staging/lib/modules/5.10.233-qki-consolidate-dirty/   668 modules
+```
+
+Every driver the port needs is now built from source for our own kernel:
+
+```
+gcc-waipio.ko  phy-qcom-ufs.ko  phy-qcom-ufs-qmp-v4-waipio.ko  ufs_qcom.ko
+icc-rpmh.ko  icc-bcm-voter.ko  rpmh-regulator.ko  rpmhpd.ko  clk-rpmh.ko
+clk-qcom.ko  spmi-pmic-arb.ko  pinctrl-waipio.ko  arm_smmu.ko  cmd-db.ko  smem.ko
+```
+
+(the build only fails at the very last dtbo packaging step, `mkdtboimg.py` with an
+unmatched glob - irrelevant for the kernel and modules)
+
+### D.3 Current blocker
+
+Booting `platform Image + OpenHarmony ramdisk + 90 of those modules` resets after
+~13 s with no data in `logdump` - and `logdump` is exactly what cannot be written
+when UFS is missing, so the failure is invisible again.  Two facts are established:
+
+* a **GKI build** of the same tree (no vendor drivers) boots fine (minimal ramdisk
+  powers off after ~14 s), so the toolchain and packaging work;
+* the platform kernel with our init + modules **panics** - either a module probe
+  crashes before its suppliers are up (loading is already dependency-ordered from
+  `modules.dep`) or PID 1 dies, which panics the kernel by definition.
+
+The next diagnostic is the platform Image with the **minimal v6 logger ramdisk**:
+if that powers off normally the kernel is fine and the fault is in the init/module
+path; if it resets too, the platform kernel itself is the problem.
+
+### D.4 Useful invariant discovered
+
+`logdump` can only be written from a kernel that already has UFS, so it is useless
+for diagnosing storage bring-up.  Use the power-off delay encoding instead
+(`sleep(10 + value); reboot(RB_POWER_OFF)`), which needs nothing but a working
+kernel.
