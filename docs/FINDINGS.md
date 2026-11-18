@@ -663,3 +663,37 @@ freezes on early probe, so OpenHarmony's kernel features (access_token/tokenid,
 binder extensions, hmdfs) cannot be added yet.  The next milestone is a
 self-built kernel that boots *and* has UFS, i.e. reproducing the vendor build
 system (clang-r416183b, `build.config.msm.waipio`, LTO+CFI) - see Appendix A.4.
+### B.7 Control experiment: the reset is caused by OpenHarmony's init
+
+Two boots of the same image, differing only in whether OpenHarmony's init is
+executed:
+
+| variant | behaviour |
+|---|---|
+| full chain, then **park forever** instead of exec | stays at the boot logo **indefinitely** |
+| full chain, then `exec /system/bin/init` | resets after **~80 s** |
+
+So the ~80 s reset is **not** a bootloader or watchdog timeout: it is a kernel
+panic caused by OpenHarmony's init.  (`qcom_wdt_core`, `qcom_enhance_watchdog`,
+`qcom_soc_wdt` and `init_watchdog` all load fine; feeding a watchdog device is
+irrelevant because this kernel keeps the watchdog entirely in a kernel thread and
+exposes no `/dev/watchdog` at all.)
+
+That narrows the remaining work to exactly one thing: the stock kernel lacks the
+OpenHarmony kernel interfaces (tokenid / access_token, binder extensions, ...),
+and a stock kernel cannot be patched - `vendor_boot` is signature-locked and only
+the `boot.img` ramdisk is replaceable.
+
+Capturing the panic trace was not possible from userspace: `panic()` stops every
+other CPU, so a forked logger never runs again, and neither `logfs` (8 MB, empty)
+nor `logdump` (512 MB, no kernel data) receives the dump on this device.
+
+### B.8 Next steps, in order
+
+1. Trace OpenHarmony's init syscalls with `ptrace` from our own init (the parent
+   stays alive, logs the last syscalls into `logdump`), with the child made PID 1
+   of a new PID namespace so it still performs its boot sequence.  That names the
+   exact missing interface.
+2. Build the missing interfaces into a kernel we can boot: reproduce the vendor
+   build system (clang-r416183b, `build.config.msm.waipio`, LTO+CFI) so UFS comes
+   up in a self-built kernel, then apply the OpenHarmony patches.
