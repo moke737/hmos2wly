@@ -1340,3 +1340,102 @@ exactly the channel every failed experiment above was missing.
 
 Without it, further work on our own kernels is guesswork: the last three sessions
 produced a well-documented wall rather than a boot.
+---
+
+## Appendix I - 2026-11-20: seeing inside HarmonyOS init, and loading our own kernel modules
+
+This session finally produced a working diagnostic loop, and with it a series of fixes
+that moved the boot from **34 s to 68 s** of HarmonyOS init runtime.
+
+### I.1 The diagnostic loop that works
+
+`logdump` (512 MB, `sde66`) is the channel:
+
+1. our init finds the partition through `/sys/class/block/*/uevent` (`PARTNAME=logdump`)
+   and **creates the node itself** - `rlog()` had never worked before because
+   `/dev/block/<name>` does not exist until `uevent_all()` runs much later;
+2. the OEM kernel also writes its own boot log there (`<level>,<seq>,0,-,caller=T0;...`),
+   which is a second, free source;
+3. our init forks a child that **streams `/dev/kmsg` into logdump at 4 MiB**, so kernel
+   and HarmonyOS messages survive the reset.
+
+Reading it back: boot TWRP (`fastboot flash boot_a boot.img; fastboot reboot recovery`)
+and `dd if=/dev/block/by-name/logdump`.  The partition **persists across boots**.
+
+### I.2 What HarmonyOS init actually does on this phone
+
+```
+[pid=1][Init][INFO] Start init first stage.
+[pid=1][ueventd] symlink /dev/block/sde54->/dev/block/platform/soc/1d84000.ufshc/by-name/vendor_boot_b
+[pid=1][Init][INFO] boot stage: init finish.
+[pid=1][Init][INFO] LoadSelinuxPolicy
+[pid=1][Init][INFO] ServiceStart started info hilogd(pid 257 uid 1036)
+[pid=1][Init][INFO] ServiceStart started info samgr(pid 287 uid 5555)     (27.7 s)
+[pid=1][Init][WARNING] Child process samgr(pid 287) exit with code : 255   (63.0 s)
+[pid=1][Init][ERROR] ServiceReap error critical service crashed samgr 1
+[bootfail] ProcessCriticalProcessFault serviceName is samgr
+[pid=1][Init][INFO] init_reboot.c:24 ExecReboot panic
+```
+
+So init is **PID 1**, the first stage completes, SELinux policy loads, hilogd comes up
+and creates its sockets, samgr starts - and then, **36 seconds later**, samgr exits 255,
+which the boot detector treats as a fatal fault and reboots.
+
+### I.3 Fixes that were needed to get this far
+
+| fix | evidence it mattered |
+|---|---|
+| `rlog` creates the logdump node itself | before: no log ever appeared; after: `V59 blocks=131` |
+| freeze `/sys/fs/selinux/enforce` at 0 (bind mount) | the run stopped dying right after `LoadSelinuxPolicy`; `avc ... permissive=1` |
+| `default_boot_device=1d84000.ufshc` (the real address; `1da4000` was wrong) + `androidboot.bootdevice`, `verifiedbootstate=orange`, `vbmeta.device_state`, `flash.locked`, `slot_suffix` | ueventd went from "Not found device for partitionName" for everything to creating the `/dev/block/.../by-name/*` symlinks |
+| mount `/vendor` from the `vendor` dm device (dm-2, erofs) | `mounted dm-2 at /vendor`; before this `/vendor/etc/...` was unreachable |
+| format `userdata` as f2fs and mount it at `/data` | before: `/data` was a tmpfs; after: `mounted /dev/block/sda14 at /data (f2fs)` |
+| mount **binderfs** and link `/dev/binder`, `hwbinder`, `vndbinder` | GKI provides binder only through binderfs; `/dev` had no binder node at all |
+| load **`access_tokenid.ko`** and create `/dev/access_token_id` (10:120) | `failed to set access token` went from ~20 occurrences to **0** |
+
+### I.4 The big capability: our own kernel modules load into the stock kernel
+
+`CONFIG_MODULE_FORCE_LOAD` is **not** set in the OEM kernel, so a module must match both
+the vermagic and the symbol CRCs.  Building against `common` (OnePlus's own tree) with
+
+* `scripts/setlocalversion` forced to `echo "-o-g5012cb8f472f"` (the exact stock release
+  string, taken from the version line inside `boot.img`), and
+* `gki_defconfig` with ThinLTO and CFI (i.e. what the stock modules themselves use),
+
+produces `access_tokenid.ko` with
+
+```
+vermagic=5.10.236-o-g5012cb8f472f SMP preempt mod_unload modversions aarch64
+```
+
+which the stock kernel **accepts**:
+
+```
+token: module loaded from /access_tokenid.ko
+```
+
+That means kernel features can now be added **without rebuilding the kernel** - which
+was the wall described in Appendix H.  Anything expressible as a module is back on the
+table (the access-token driver, and potentially more).
+
+### I.5 Where it stands
+
+* HarmonyOS init runs as PID 1 for **68 s**, hilogd and samgr start, the service set
+  comes up, root filesystems and device nodes are all in place;
+* **samgr exits with code 255 after ~36 s**, and that is what ends the boot;
+* samgr's own diagnostics do not reach us yet: hilogd is running and its sockets exist,
+  but `/data/log` is never created, so nothing is written to disk.  Giving HarmonyOS a
+  writable `/data/log/hilog` (and `/data/log/faultlog`) before `exec` is the obvious next
+  probe - samgr's error message should then be in those files;
+* the remaining reboot is `ExecReboot panic` from the boot detector, reached because
+  samgr - a critical service - died.
+
+### I.6 Files worth keeping from this session
+
+```
+m0b/module/access_tokenid.c        the stand-in driver (pid-keyed token table)
+m0b/module/access_tokenid.ko       built, vermagic matches the stock kernel
+m0b/build_module.sh                how it is built
+m0b/preinit_v59.c .. v70.c         the init generations; v70 is the current best
+m0b/boot_v70_binderfs.img          latest working image
+```
