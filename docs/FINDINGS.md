@@ -1277,3 +1277,66 @@ m0b/preinit_v50.c, v51.c          aliveness probes with a self-contained logdump
 m0b/boot_cfi_test.img             CFI+LTO kernel, size-identical to the OEM one
 kp2/kernel_platform/common/out-cfi/Image   the CFI/LTO build
 ```
+---
+
+## Appendix H - 2026-11-19 late: every kernel we build is unusable, and why
+
+### H.1 The decisive control experiment
+
+A trivial init (mount proc/sys/dev, `sleep(25)`, `reboot(RB_POWER_OFF)`) was flashed with
+each of our kernels.  Every one of them resets at **13 s of black screen + 17 s**:
+
+| kernel | ramdisk / init | result |
+|---|---|---|
+| `out-cfi` (OEM config, CFI, thin LTO) | trivial idle init | 13 s + 17 s reset |
+| `out-gki2` (gki_defconfig, CFI, thin LTO) | trivial idle init | 13 s + 17 s reset |
+| `kp-out` (the one that "booted") | lean 392 KB ramdisk, full init | 13 s + 17 s reset |
+| `kp-out` | lean ramdisk, idle init | 13 s + 17 s reset |
+| `kp-out` | lean ramdisk, watchdog-only init | 13 s + 17 s reset |
+| `kp-out` | **k6 logger** (powers off after ~11 s) | **power off, "success"** |
+| stock OEM kernel | our init + stock modules | runs **82 s**, HarmonyOS init executes |
+
+**The k6 result was a false positive**: it powered the phone off *before* the failure
+that happens ~13 s after userspace starts, so it looked like a working kernel.
+
+This also invalidates the earlier module bisects: the "hangs" attributed to
+`phoenix_reboot_speed`, `iommu-logger`, `qcom_glink` etc. were most likely this same
+kernel-level failure, since every experiment that ran longer than ~13 s of userspace
+ended the same way.
+
+### H.2 Why the failure cannot be seen
+
+Each potential log channel depends on the system already working:
+
+```
+logdump   needs UFS  -> needs the vendor modules -> needs a working kernel
+pstore    /sys/fs/pstore is empty (ramoops never registers)
+USB serial needs dwc3-msm -> needs the vendor modules -> needs a working kernel
+dmesg      lives in RAM, lost on reset
+```
+
+That is why every session so far ended with timing codes rather than a stack trace.
+
+### H.3 What is actually established
+
+* **HarmonyOS init runs on the phone** - repeatedly, on the stock kernel, for ~82 s,
+  with `dm` mapping, `/usr` mounted, and 2103 traced syscalls from an earlier probe;
+* the **stock kernel configuration** is fully recovered (`docs/oem-kernel-config.txt`)
+  and the boot kernel contains **no vendor driver** - UFS arrives as the 144 stock
+  modules;
+* the stock modules are built with **ThinLTO + CFI + shadow call stack**, and a
+  matching build of `common` reproduces a **39,321,684-byte** kernel with the same
+  vermagic (the OEM's is 39,720,164);
+* nevertheless **every kernel we build fails** ~13 s after userspace starts;
+* the failure is invisible through all four software channels.
+
+### H.4 The only remaining move
+
+**UART.**  `console=ttyMSM0,115200n8` is already in the OEM cmdline (and the vendor
+cmdline even carries `msm_geni_serial.con_enabled=0`, which disables it - repacking
+`vendor_boot` with that flag flipped would enable it).  A USB-TTL adapter on the
+phone's UART pads would give the kernel's console from the first instruction, which is
+exactly the channel every failed experiment above was missing.
+
+Without it, further work on our own kernels is guesswork: the last three sessions
+produced a well-documented wall rather than a boot.
