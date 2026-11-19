@@ -1144,3 +1144,136 @@ because the bisect stopped there.
    a stable module set this time;
 4. only then think about kernel patches (OpenHarmony's tokenid/binder), which will
    need a custom kernel anyway - but by then the userspace side will be complete.
+---
+
+## Appendix G - 2026-11-19: the OEM kernel config, CFI, and the structural wall
+
+### G.1 The OEM kernel configuration was recovered
+
+The stock `boot.img` kernel embeds its config (`CONFIG_IKCONFIG=y`): after gunzipping the
+39,720,164-byte kernel, `IKCFG_ST` sits at 21,185,824 and the payload is a 39,854-byte
+gzip block.  Decompressed it is the full **6789-line configuration** of the running
+kernel (`m0b/stock_config.txt`).  Two facts matter:
+
+```
+# CONFIG_SCSI_UFS_QCOM is not set
+# CONFIG_ARM_SMMU is not set
+# CONFIG_QCOM_RPMH is not set
+CONFIG_LOCALVERSION=""
+CONFIG_MODVERSIONS=y
+CONFIG_LTO_CLANG_THIN=y
+CONFIG_CFI_CLANG=y
+CONFIG_SHADOW_CALL_STACK=y
+```
+
+* the **boot kernel contains no vendor driver at all** - UFS, clocks, RPMh, SMMU all
+  arrive as the 144 stock modules from `vendor_boot`;
+* the kernel is built with **ThinLTO + CFI + shadow call stack**.
+
+### G.2 CFI was the (first) reason stock modules misbehaved
+
+Every stock module carries `.cfi_jt` symbols, i.e. it was compiled with
+`CONFIG_CFI_CLANG=y`.  Our earlier builds removed LTO and CFI (to keep the link inside
+this machine's memory) - a CFI-built module loaded into a non-CFI kernel calls through
+jump tables the kernel does not provide.
+
+Rebuilding `common` with the OEM config **including** `LTO_CLANG_THIN`, `CFI_CLANG` and
+`SHADOW_CALL_STACK` works once WSL gets enough memory (9.7 GB thrashed; 12 GB + 32 GB
+swap finished in 458 s), and the result is **byte-for-byte the same size as the OEM
+kernel** (39,720,164 bytes), with identical vermagic.
+
+But: the stock modules **still hang** that kernel.  The OEM kernel reports
+`5.10.236-o-g5012cb8f472f` while the modules report `5.10.236-gki-g0b92723d0f5a`, and
+`5012cb8f472f` does not exist in any branch of
+`OnePlusOSS/android_kernel_common_oneplus_sm8450` (four branches were checked), so their
+exact source state is not public.
+
+### G.3 The one configuration that works, and where it stops
+
+The only combination that reaches userspace is **stock kernel + our ramdisk + the stock
+modules**:
+
+```
+init version 15, block devices=131
+dm system -> dm-0 ... dm patch -> dm-5
+mounting /dev/block/dm-0 at /usr
+mount ok, exec OH init as PID 1          <- HarmonyOS init runs
+... 82 s later the screen goes black, 17 s after that the phone resets
+```
+
+Bisecting the module list showed `phoenix_reboot_speed.ko` (the first entry) **hangs**
+a non-Android boot; excluding it lets the pipeline reach HarmonyOS init.  The stock
+kernel itself loads it fine, so this too is a difference between our kernels and theirs.
+
+### G.4 The 82 s failure is a kernel fault, not a userspace reboot
+
+Three experiments bound it:
+
+| experiment | result |
+|---|---|
+| seccomp filter returning EPERM for `reboot()` before `exec` | the 80 s reboot becomes a **black screen** - init's `reboot(panic)` is the thing that was rebooting |
+| also disabling sysrq and binding `/proc/sysrq-trigger` to `/dev/null` | unchanged: black screen at ~82 s, reset ~17 s later |
+| forked watchdog feeder (survives `exec`, keeps writing to `/dev/watchdog*`) | **no effect** |
+
+So after the reboot request is refused, something inside the kernel faults at ~82 s;
+with `panic=0` the kernel hangs and the **hardware** watchdog resets the phone ~17 s
+later.  Nothing in userspace can prevent that.
+
+### G.5 Why the panic cannot be read (four channels, all closed)
+
+| channel | why it fails |
+|---|---|
+| `logdump` (512 MB) | **persists across boots** (verified with a marker) and holds the v15-v27 era log, but none of the newer inits ever wrote to it, even after the device lookup was reimplemented to scan `/sys/class/block/*/uevent` itself |
+| pstore/ramoops | the DT *does* have `ramoops_region` and the config has `PSTORE_RAM/CONSOLE` plus `pstore.compress=none` in the cmdline, but `/sys/fs/pstore` is empty in TWRP **and** after a deliberate sysrq crash |
+| USB serial console | the kernel has `CONFIG_USB_CONFIGFS_SERIAL` and `ttyGS`, but the gadget needs `dwc3-msm`, whose probe needs GLINK/PMIC - and loading the stock modules into our kernel hangs |
+| partition-based dumpers | every dumper needs UFS, i.e. the modules that only load on the stock kernel |
+
+### G.6 What the sagit port actually does (juezhi6668/hmos2sagit, msm8998)
+
+Pulled both repositories; the port is a **9-patch kernel series** plus file-level patches:
+
+| patch | content |
+|---|---|
+| 0001 | binder access-token and feature-set ioctls |
+| 0002 | hmdfs/sharefs emulation at mount time |
+| 0003 | `hmos.noreboot=1` (refuses `reboot(panic)` and the `c`/`b`/`o` sysrq keys) and `hmos.permissive=1` |
+| 0004 | config: `ACCESS_TOKENID`, `BINDER_SENDER_INFO`, `OHOS_FS_EMU`, `DEVTMPFS`, system as erofs |
+| 0005 | **`/dev/access_token_id` driver** (misc device, per-task token) |
+| 0006 | keep the legacy mdss panel helpers for fbdev |
+| 0008 | carry the access token across `fork()` |
+| 0009 | icnss BDF download + `CAL_REPORT` for Wi-Fi |
+
+Plus, from their docs: the cmdline carries `ohos.required_mount.system=...@/usr@erofs@...`
+so HarmonyOS mounts its own filesystems; `/data` must be a **dm device**, not the raw
+partition; HOS creates **no** `/dev/block/by-name/`; and the display is a **fbdev
+composer** because no DRM path was usable.
+
+`0003` is what we reproduced in userspace with seccomp (G.4) - it works, and it proved
+that the 82 s event is the reboot request.
+
+### G.7 Honest state
+
+* HarmonyOS init **executes on the device** and runs for ~82 s before the kernel faults;
+* the vendor drivers can only be loaded by the stock kernel, and the HarmonyOS kernel
+  interfaces (binder token, access_token_id) can only live in a kernel we build;
+* those two statements cannot both be satisfied with the sources available publicly.
+
+The remaining ways forward, in order of expected value:
+
+1. **UART console** - the only channel that needs nothing from the kernel's own drivers.
+   Without it every failure stays invisible, which is exactly what has been limiting
+   every session so far.
+2. Find the OEM kernel's exact source state (`-o-g5012cb8f472f`) - possibly a newer
+   OnePlus release than the branches published on GitHub.
+3. Build the three HarmonyOS patches that *can* be modules against the stock kernel's
+   own symbol versions (binder cannot: it is built into the GKI kernel).
+
+### G.8 Session artefacts worth keeping
+
+```
+m0b/stock_config.txt              the OEM kernel configuration (6789 lines)
+m0b/stock_modules/                the extracted vendor_boot ramdisk (461 modules, modules.load/dep/blocklist)
+m0b/preinit_v50.c, v51.c          aliveness probes with a self-contained logdump lookup
+m0b/boot_cfi_test.img             CFI+LTO kernel, size-identical to the OEM one
+kp2/kernel_platform/common/out-cfi/Image   the CFI/LTO build
+```
