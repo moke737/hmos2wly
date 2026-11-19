@@ -1616,3 +1616,37 @@ userspace.
 The chain of dependencies is now completely mapped: every remaining step after samgr
 depends on the IPC layer working, and that layer needs a kernel-level binder extension -
 the one thing that cannot be added without a kernel that boots.
+### K.1 The self-built kernel dies about one second into userspace
+
+Systematic timing over every kernel we built, with initramfs images that deliberately do
+almost nothing:
+
+| kernel | init | result |
+|---|---|---|
+| `out-cfi` (OEM config) | mount, sleep 25, power off | 12 s logo, black, reset 17 s later |
+| `out-cfi` | mount, **sleep 5**, power off | **identical** - the power-off never ran |
+| `out-gki2` (gki_defconfig, ThinLTO+CFI) | mount, sleep 25, power off | identical |
+| `out-oem` (OEM config, no LTO) | full HarmonyOS pipeline | identical |
+| `kp-out` | lean ramdisk, idle init | identical |
+| **stock OEM kernel** | the same images | runs normally, powers off, boots HarmonyOS init |
+
+The five-second variant is the decisive one: if the kernel were alive at five seconds it
+would have powered the phone off.  It did not, so the kernel is already dead about a
+second into userspace, and the 17 s that follow are the hardware watchdog.
+
+The delay is **identical for every configuration we built** - OEM config, gki_defconfig,
+with and without LTO/CFI, standalone and platform builds - and the stock kernel never
+shows it.  So it is not a configuration choice: something about a kernel built from these
+sources on this machine is incompatible with this bootloader/hardware state, and the
+kernel did not get far enough to record why (no pstore record, ramoops registers only on
+the stock kernel's boot log path, no serial console, and logdump needs the UFS drivers
+that only load on the stock kernel).
+
+### K.2 What remained unexplored
+
+* **UART** (`console=ttyMSM0`) - the only channel independent of every driver, and the
+  reason the sagit port could iterate at all;
+* the OEM kernel's exact source state (`5.10.236-o-g5012cb8f472f`) - not on any public
+  branch of the OnePlusOSS repository;
+* a minimal watchdog-feeding module - attractive, but the five-second experiment shows the
+  kernel dies long before a watchdog could matter.
