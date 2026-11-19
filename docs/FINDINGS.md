@@ -1559,3 +1559,60 @@ constructs (`/usr/usr/system/bin/...`) suggests it expects the system image moun
 somewhere else (in the sagit port the system partition is mounted at `/usr` **and** the
 image root contains `system/`, `usr/`, ... so `/usr/usr/...` can be legitimate).  Worth
 re-checking once the parameter problem is solved.
+---
+
+## Appendix K - the last blocker identified: OH's binder context extension
+
+Reading samgr's own binary (`/data/samgr.bin`, pulled from the device) gives the exact
+call that fails:
+
+```
+OHOS::IPCSkeleton::SetContextObject(sptr<IRemoteObject>&)   <- fails
+OHOS::IPCSkeleton::GetCallingTokenID()
+samgr--main_setContextObject
+set context fail!
+```
+
+Order of events in `SystemAbilityManager::Init()`:
+
+```
+SAMGR: main called, enter System Ability Manager
+SAMGR: InitProfile spend 28ms
+SAMGR: System Ability Manager enter init
+SAMGR: set context fail!                 <- IPCSkeleton::SetContextObject
+SAMGR: set samgr ready ret : failed      <- consequence: no SA context, param write refused
+SAMGR: JoinWorkThread error, samgr main exit!
+```
+
+`SetContextObject` publishes HarmonyOS's IPC "context object" to the kernel binder
+driver so that every later transaction carries the caller's access token.  That is
+exactly what the sagit port's **patch 0001 (binder access-token and feature-set ioctls)**
+adds to the kernel.  Android's binder has no such ioctl, so the call fails and samgr
+aborts.
+
+**Why this cannot be fixed with a module**: the OEM kernel has
+
+```
+CONFIG_ANDROID_BINDER_IPC=y
+```
+
+binder is built in, so there is no `binder_linux.ko` to replace (the module list contains
+only `oplus_binder_strategy.ko`).  The extension has to be inside the kernel image, and
+Appendix H established that a locally built kernel does not survive past ~13 s of
+userspace.
+
+### Where the port stands
+
+| layer | state |
+|---|---|
+| boot chain, ramdisk, init hand-over | working |
+| HarmonyOS init as PID 1 | working, 68 s |
+| root filesystems, /vendor, /data, device nodes, access token device | working |
+| SELinux, cmdline, ueventd, passwd | working |
+| hilog | needs a kernel half (`/dev/hilog`) |
+| **samgr** | **blocked on the OH binder context ioctl** |
+| display, touch, network, audio, baseband | not started |
+
+The chain of dependencies is now completely mapped: every remaining step after samgr
+depends on the IPC layer working, and that layer needs a kernel-level binder extension -
+the one thing that cannot be added without a kernel that boots.
