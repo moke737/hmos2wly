@@ -1439,3 +1439,42 @@ m0b/build_module.sh                how it is built
 m0b/preinit_v59.c .. v70.c         the init generations; v70 is the current best
 m0b/boot_v70_binderfs.img          latest working image
 ```
+### I.7 The next missing kernel interface: /dev/hilog
+
+HarmonyOS logging has a **kernel half**.  `hilogd` starts fine and creates its sockets
+(`hilogInput`, `hilogControl`, `hilogOutput`), but every library keeps printing
+
+```
+HiLogAdapter_init: Can't connect to server. Errno: 2
+HiLogBase: Can't connect to server. Errno: 2
+```
+
+because the client side opens `/dev/hilog`, a Huawei character device (ring buffer plus
+ioctls) that does not exist in an Android kernel.  Consequences:
+
+* no service can log anything, so **samgr's reason for exiting with 255 is invisible**;
+* `/data/log/*` stays empty - we created the directories and they are still empty after
+  a full run, exactly as this explanation predicts.
+
+Since modules now load into the stock kernel (I.4), this is solvable the same way as the
+access token: write a small `/dev/hilog` driver, build it with the same forced release
+string, ship it in the ramdisk.  Once hilogd has somewhere to write, every service's
+output - including samgr's - becomes readable, and the remaining failure can finally be
+diagnosed instead of guessed.
+
+### I.8 Session summary
+
+Reached, in one evening:
+
+* a reproducible diagnostic loop (`logdump`, kernel log capture, rlog node creation);
+* HarmonyOS init as PID 1 running **68 s**, with hilogd and samgr actually starting;
+* seven concrete fixes (SELinux freeze, boot-device cmdline, `/vendor`, `/data` as real
+  f2fs, binderfs, access-token module + node, log tree);
+* **kernel modules of our own now load into the stock kernel** - the wall in Appendix H
+  is gone.
+
+Remaining, in order:
+
+1. `/dev/hilog` driver module -> service logs become visible;
+2. read samgr's fault and fix what it needs;
+3. then the boot detector stops firing `ExecReboot panic` and the system should stay up.
