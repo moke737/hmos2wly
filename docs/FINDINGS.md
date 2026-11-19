@@ -1650,3 +1650,83 @@ that only load on the stock kernel).
   branch of the OnePlusOSS repository;
 * a minimal watchdog-feeding module - attractive, but the five-second experiment shows the
   kernel dies long before a watchdog could matter.
+---
+
+## Appendix L - researching how others build a booting kernel for this device
+
+### L.1 The repositories are not interchangeable
+
+| repository | what it is |
+|---|---|
+| `OnePlusOSS/android_kernel_common_oneplus_sm8450` | the **GKI common** kernel, with OnePlus's vendor hooks (`android_vendor_data1`, `android_vh_*` trace points).  This is what we had been building |
+| `OnePlusOSS/android_kernel_msm-5.10_oneplus_sm8450` | the **device kernel tree**: `VERSION=5.10.236`, contains `drivers/soc/oplus`, `techpack`, and its commit is literally *"Synchronize code for OnePlus NE2210_16.0.3.520"* - our exact OS build |
+| `OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8450` | vendor sources, `kernel_platform/` (msm-kernel), devicetree, and the vendor config fragments |
+
+Cloned the device tree (1.4 GB, 68 698 files) and read the public build guide
+([seraphin.xyz/articles/oneplus.html](https://seraphin.xyz/articles/oneplus.html)).
+
+### L.2 What the guide adds that we were missing
+
+1. **Three source fixes** the tree needs before it compiles at all:
+
+   * `mm/vmscan.c` uses `scan_adjusted` without declaring it (we added `bool scan_adjusted = false;`
+     and removed the now-unused `proportional_reclaim`);
+   * `drivers/thermal/thermal_sysfs.c` uses `kvzalloc`/`kvfree` which the tree does not
+     declare (the guide switches them to `kzalloc`/`kfree`);
+   * `drivers/android/binder_alloc.c` calls `mmget_still_valid()`, absent here (the guide
+     comments the check out).
+
+2. **Vendor sources must be symlinked into the kernel tree** - `arch/arm64/boot/dts/{qcom,oplus,vendor}`,
+   `include/soc/oplus/{boot,dft}`, `drivers/soc/oplus/{boot,dfr,dft,power,system}` and
+   `drivers/input/oplus_secure_drivers` - otherwise vmlinux links against vendor symbols
+   that were never compiled (`qcom_smem_alloc`, `get_project`).
+
+3. Their vendor cmdline is built with **`console=ttyMSM0,115200n8 earlycon msm_geni_serial.con_enabled=1`** -
+   i.e. OnePlus develops this kernel **with the UART console on** (the shipping image sets
+   `con_enabled=0`).  That is independent confirmation that a serial line is the normal way
+   to work on this kernel.
+
+### L.3 Where our build of the official tree got to
+
+With the three fixes applied and the vendor symlinks in place, the build compiles the whole
+kernel and reaches the **final link**, which fails on three vendor symbols
+(`qcom_smem_alloc`, `qcom_smem_get`, `get_project`) because the config applied was
+`gki_kernel/common/.config` - the **GKI half** of the build, without the vendor fragments.
+
+Building the tree **standalone** instead (`gki_defconfig` + `waipio_GKI.config` +
+`waipio_consolidate.config`) fails the other way round: the vendor code needs the vendor
+hooks (`android_vendor_data1`, `register_trace_android_vh_*`) that live in the **common**
+tree, which a standalone build of the device tree does not have.
+
+So the two trees are two halves of one build: common (with hooks) + device tree + vendor
+sources, assembled by `build/base/build.sh` - which is exactly the platform build we
+already had working in Appendix D.
+
+### L.4 Two packaging experiments
+
+* **gzip-compressed kernel** (16 793 211 B, `gzip -n`): the bootloader does **not** start it
+  - the phone sits on the boot logo indefinitely, with no kernel activity at all;
+* **uncompressed Image** (39 720 164 B): starts normally, then dies about a second into
+  userspace (Appendix K).
+
+The stock image ships a gzip kernel (16 823 694 B) that boots, so compression is not
+inherently rejected; our compressed image simply is not accepted.  Nothing was gained by
+either variant.
+
+### L.5 Byte comparison, for the record
+
+Our CFI build and the OEM kernel are **the same size** (39 720 164 B) - same config, same
+compiler, same layout - but **30 620 065 of those bytes differ**, i.e. they are different
+compilations, not a near-copy with a small patch.  The size match confirms the
+configuration is right; the byte differences confirm the code is not the same.
+
+### L.6 Conclusion of this research
+
+Everything the public build guides describe has been tried: the right trees, the documented
+source fixes, the vendor symlinks, the exact compiler, ThinLTO + CFI, and three separate
+packaging schemes.  The build that is architecturally correct (the platform build of
+Appendix D) produces a kernel that **boots and then dies one second into userspace**, and
+no software channel on this device can show why.
+
+The one thing every guide assumes - a serial console on `ttyMSM0` - is the one thing this
+port does not have.
