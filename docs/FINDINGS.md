@@ -1478,3 +1478,84 @@ Remaining, in order:
 1. `/dev/hilog` driver module -> service logs become visible;
 2. read samgr's fault and fix what it needs;
 3. then the boot detector stops firing `ExecReboot panic` and the system should stay up.
+---
+
+## Appendix J - 2026-11-20 early hours: samgr's actual failure
+
+The service wrapper finally exposed the reason the port reboots 68 s in.
+
+### J.1 The technique
+
+HarmonyOS init executes `/usr/system/bin/samgr` directly, so our init now
+
+1. copies the real binary to `/data/samgr.bin`,
+2. writes `/data/samgr.sh` (`exec /data/samgr.bin "$@" >>/data/samgr.out 2>>/data/samgr.err`),
+3. **bind-mounts** that script over `/usr/system/bin/samgr`.
+
+The service then runs through the wrapper and its stderr lands on `/data`, which we read
+from TWRP.  This works even though hilog is unusable, and applies to any service.
+
+### J.2 What samgr says
+
+```
+[pid=284][Init][INFO][init_service.c:118]ServiceExec samgr
+SAMGR: set samgr ready ret : failed
+SAMGR: JoinWorkThread error, samgr main exit!
+```
+
+and the boot detector is waiting for exactly that parameter:
+
+```
+[bootfail] ServiceLaunch name: bootevent.samgr.ready
+[bootfail] StartTimer serviceName samgr, paramName samgr.ready
+```
+
+So the chain is now fully understood:
+
+1. samgr starts (27.6 s) and initialises;
+2. it tries to publish `bootevent.samgr.ready` through **HarmonyOS's parameter
+   service** and the write is **refused**;
+3. samgr gives up (`JoinWorkThread error`), exits 255;
+4. the boot detector's timer for `samgr.ready` expires, declares a critical-service
+   fault, and calls `ExecReboot panic`;
+5. the phone resets at ~68 s.
+
+The parameter system had been complaining all along:
+
+```
+[PARAM][ERROR] Forbid to access parameter musl.log.enable
+[PARAM][ERROR] SystemReadParam failed! name is:const.cust.config_dir_layer, errNum is:1002
+[PARAM][WARNING] Not enough memory for label index 64 need to extend memory 64
+[PARAM][INFO] Max selinux label 192 162
+```
+
+### J.3 Why this is the right thing to chase next
+
+It is no longer "samgr crashes for unknown reasons".  The remaining problem is narrow
+and inspectable: **why does a parameter write fail** for a service that in a real
+HarmonyOS device is allowed to write `bootevent.samgr.ready`?
+
+Candidates, in order of likelihood:
+
+* the parameter **work area** is missing or not writable (OH keeps it in shared memory
+  set up by `param_service`, and our `/data` was only just formatted);
+* OH's own DAC layer (`*.para.dac` files - they *do* load: "Load parameter label total
+  20 success /system/etc/param/samgr.para.dac") rejects the writer's uid because the
+  service uid mapping (samgr runs as uid 5555 here) differs from a real device;
+* a missing kernel interface for the parameter service, the same class of problem as the
+  access token - in which case it can be solved the same way, with a module.
+
+The next probe is to wrap **`param_service`** the same way samgr was wrapped, and read
+its stderr.
+
+### J.4 Also noted
+
+```
+[pid=1][Init][ERROR][switch_root.c:121]Failed to mount moving /usr/system/bin/samgr to /usr/usr/system/bin/samgr, err = 2
+```
+
+HarmonyOS init performs a move-mount of files it has been told about; the path it
+constructs (`/usr/usr/system/bin/...`) suggests it expects the system image mounted
+somewhere else (in the sagit port the system partition is mounted at `/usr` **and** the
+image root contains `system/`, `usr/`, ... so `/usr/usr/...` can be legitimate).  Worth
+re-checking once the parameter problem is solved.
