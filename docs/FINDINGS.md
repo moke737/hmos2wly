@@ -1884,3 +1884,54 @@ through a parameter.  Either is a small change to an otherwise working module.
 * With the stand-in installed, the cleared capture contains **zero** `SAMGR` lines, where
   an unmodified boot contains them - independent confirmation that the replacement is what
   runs.
+---
+
+## Appendix O - the kernel-side capture works, and where it stops
+
+`kmsgdump.ko` now captures the kernel log from a kernel thread, which - unlike any
+user-space logger - survives HarmonyOS init's `kill(-1)`.
+
+### O.1 What it took
+
+| iteration | failure | fix |
+|---|---|---|
+| console hook | module would not load: `Unknown symbol filp_open` | `MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver)` |
+| console hook | registered but silent: the kernel only enables the **first** console | `.flags = CON_PRINTBUFFER \| CON_ENABLED` |
+| console hook | printk **deadlocked** the moment the console was enabled (log stopped at 1.857 s) | abandon the console; read `/dev/kmsg` from the kthread instead |
+| kmsg read | `kernel read not supported for file /kmsg` | `/dev/kmsg` implements `->read`, not `->read_iter` |
+| kmsg read | `Unknown symbol vfs_read` | call `file->f_op->read()` directly |
+| file target | log file created but empty, and later created on the ramdisk's /data | the caller opens the file and passes the **fd**; `fget()` in `module_init` (which runs in init's own process context) returns the real file |
+
+The working recipe:
+
+```
+our init:  fd = open("/data/kmsgdump.log", O_WRONLY|O_CREAT|O_APPEND)
+           finit_module(kmsgdump.ko, "out_fd=<fd>")
+module:    out_fp = get_file(fdget(out_fd).file)      // init's own file
+           kmsg_fp = filp_open("/dev/kmsg", O_RDONLY|O_NONBLOCK)
+           kthread: n = kmsg_fp->f_op->read(...); kernel_write(out_fp, ...)
+```
+
+Result on the device: `/data/kmsgdump.log` grows to **765 862 bytes / 10 060 lines**, with
+the thread reporting `reads=200/400/... errors=0`.
+
+### O.2 Where it still stops
+
+The last timestamp in the file is **1.877 s**, and the last line is the thread's own
+diagnostic at 1.889 s - after that the thread produces nothing, even though it is a
+kernel thread and cannot be killed by `kill(-1)`.  The likely cause is that the write to
+the f2fs file blocks when HarmonyOS init **remounts /data** a fraction of a second later.
+
+Fixes worth trying next, in order of simplicity:
+
+1. write into **tmpfs** (`/tmp/kmsgdump.log`) and copy it to /data from our init on the
+   *next* boot - tmpfs cannot block on a remount;
+2. map the **ramoops** reserved region and write there (survives reboot, needs no fs);
+3. hold the file open but re-open it after the remount, detected by a write timeout.
+
+### O.3 What this buys
+
+Everything up to 1.877 s is now available with the vendor's own line format
+(`seq,level,timestamp,-,caller=Tnn;message`), including the whole pre-init boot and every
+message our init emits.  The remaining blind spot is exactly the region HarmonyOS init
+owns - and it is now one blocking write away rather than an unsolved problem.
