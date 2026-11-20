@@ -1935,3 +1935,28 @@ Everything up to 1.877 s is now available with the vendor's own line format
 (`seq,level,timestamp,-,caller=Tnn;message`), including the whole pre-init boot and every
 message our init emits.  The remaining blind spot is exactly the region HarmonyOS init
 owns - and it is now one blocking write away rather than an unsolved problem.
+### O.4 Later attempts and the final diagnosis
+
+Two more designs were tried:
+
+* **write to the raw logdump partition instead of a file on /data**, to rule out the f2fs
+  remount as the cause of the stall.  The write path works (data appears at 64 MiB), but
+  the log still ends at **1.866 s** - so the stall was never about the file.
+* **console hook with a lock-free ring** (no spinlock, only release semantics, so printk
+  re-entrancy cannot deadlock).  This version produced **no data at all**: the 64 MiB
+  region still contained the previous boot's text, so the console path disturbed printk
+  before the ring could be flushed.
+
+Combining the two observations gives the actual explanation of the 1.87 s ceiling:
+
+> **The kernel log ring is cleared when HarmonyOS init starts.**  Reading `/dev/kmsg`
+> therefore stops yielding new records at exactly that moment, even though the reader is a
+> kernel thread that nothing can kill.  The console route is the only way to receive
+> messages as they are produced, and on this kernel a second console either stalls printk
+> (spinlock version) or produces nothing (lock-free version).
+
+So the capture is reliable **up to the hand-over** and blind after it.  Getting past that
+needs either a console implementation that co-exists with the vendor console on this
+kernel, or a way to keep init from clearing the ring (e.g. via the vendor's own
+`op_kernel_log` interface, which visibly keeps working - "Start write back log" appears at
+1.88 s and it clearly records more).
