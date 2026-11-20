@@ -2073,3 +2073,43 @@ before starting services.
 The original super image is restored on the device, and both the modified
 (`super_hmos_mod.img`) and control (`super_hmos_ctrl.img`) images are kept on disk for
 the next attempt.
+### P.5 Preserving xattrs was necessary but not sufficient
+
+`fsck.erofs` in erofs-utils **1.7.1** (the Ubuntu build) has no xattr extraction at all;
+the OEM image stores **48 bytes of xattr per file**, and `dump.erofs --path` shows it:
+
+```
+/system/bin/samgr   Size: 608584  On-disk size: 339968  Layout: 3  Xattr size: 48
+/system/bin/init    Size: 456592  On-disk size: 286720  Layout: 3  Xattr size: 48
+```
+
+Building **erofs-utils 1.9.4** from source and extracting with `--xattrs` recovers them:
+
+```
+samgr  -> security.selinux = u:object_r:samain_exec:s0
+init   -> security.selinux = u:object_r:init_exec:s0
+passwd -> security.selinux = u:object_r:system_etc_file:s0
+```
+
+The labels are also directly informative: samgr runs in **`samain_exec`**, a dedicated
+domain - which is exactly the machinery behind its "set context fail!" message.
+
+The image was rebuilt with the labels preserved (`mkfs.erofs 1.9.4`, `-z lz4hc,9`,
+`-C 65536`, `-E force-inode-compact`, same timestamp, 2 741 141 504 B, fits) and flashed -
+and the device **still powers off at 16 s**, where the original image gives the usual
+68-second cycle.
+
+So the difference is not (only) xattrs.  The remaining candidates, in order:
+
+1. **image integrity verification** - AVB/dm-verity over the system partition, or a digest
+   that HarmonyOS init checks.  The rebuild changes the image bytes no matter how faithful
+   the content is, so any such check fails.  Test: flash a `vbmeta` with
+   `--disable-verity --disable-verification` and retry;
+2. **erofs structural details** the OEM builder sets and `mkfs.erofs` does not
+   (`0padding`, shared xattrs, inode layout, compressor dictionary/window);
+3. something in the tree that `fsck.erofs --extract` does not reproduce (device nodes,
+   hardlinks, special files).
+
+Until one of those is resolved, **the system partition cannot be modified** - which also
+means the samgr replacement cannot be delivered that way, and the overlay route remains
+blocked by init's own mount.
