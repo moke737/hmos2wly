@@ -1960,3 +1960,28 @@ needs either a console implementation that co-exists with the vendor console on 
 kernel, or a way to keep init from clearing the ring (e.g. via the vendor's own
 `op_kernel_log` interface, which visibly keeps working - "Start write back log" appears at
 1.88 s and it clearly records more).
+### O.5 The vendor's own logger stops at the same place
+
+`op_kernel_log` (the OEM module) writes the live kernel log into the logdump partition -
+that is where all the `seq,level,time,-,caller=Tnn;message` lines come from.  A boot with
+**none** of our capture code (no userspace reader, no clearing, no overlay) still shows a
+vendor log that ends at **1.845 s**, with only one HarmonyOS-init line in the whole 16 MiB
+region.
+
+So the ceiling is not our instrumentation at all:
+
+> **The kernel stops feeding the log ring shortly after the hand-over.**  By the time
+> HarmonyOS init has been running for a moment, neither `/dev/kmsg`, nor our console hook,
+> nor the OEM's own log module sees anything new.
+
+This is consistent with init quieting printk (`kernel.printk = 0 0 0 0`) and/or clearing
+the ring - and it explains why the same 1.85-1.88 s boundary appears in every capture
+method we have tried, including the vendor's.
+
+The only observations that ever showed later messages were taken in boots where the
+kernel log had been written **before** this quieting took effect, which is why they looked
+like "stale data" and were dismissed at the time.
+
+**Consequence for the port**: after the hand-over, the kernel log on this system is
+inherently unavailable by design.  Any further diagnosis of samgr has to come from the
+user-space side (its stderr, `/data/log`, or a modified samgr), not from the kernel.
