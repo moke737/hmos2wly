@@ -2012,3 +2012,64 @@ example make the `super` logical partition's `system` extent expose an image we 
 (we already generate the super image with `build_lp.py`), or replace the fstab used by
 init.  Both are image-level changes, not boot-ramdisk changes, and are the natural next
 step for this port.
+---
+
+## Appendix P - the image layer: modifying the system partition directly
+
+### P.1 The layout, finally known exactly
+
+Parsing the liblp tables of the raw super image gives the real map:
+
+```
+system       offset 1048576 (1 MiB)     2951.2 MiB
+sys_prod     3096444928                 1767.8 MiB
+vendor       4950327296                  642.3 MiB
+chip_prod    5624561664                  552.4 MiB
+cust         6204424192                    5.9 MiB
+patch        6210715648                    ~0 MiB
+```
+
+The super image on disk is an **Android sparse** file (`3a ff 26 ed`), 6.2 GB on disk,
+11.27 GB raw.
+
+### P.2 What was done
+
+1. `simg2img` -> 11.27 GB raw image;
+2. `dd` the system extent out (3 094 347 776 bytes);
+3. `fsck.erofs --extract` -> 4.4 GB, 7 177 inodes;
+4. replace `system/bin/samgr` (608 584 B) with a 635 952 B probe binary;
+5. rebuild with `mkfs.erofs -b 4096 -z lz4hc,9 -C 65536 -E force-inode-compact`
+   -> 2 741 055 488 bytes, which **fits** the partition (2 951 MiB; plain `-z lz4` did
+   not fit at 3 045 MiB);
+6. `dd` back into the raw super, `img2simg`, `fastboot flash super`.
+
+### P.3 The result, and the control experiment
+
+Flashing the modified super **boots to a 16-second power-off** instead of the usual
+68-second cycle, and the probe file never appears.
+
+To separate "the rebuild is unfaithful" from "init rejects the replaced binary", a
+**control** super was built with exactly the same procedure but the **original** system
+image - and it also powers off at 16 s.  Therefore:
+
+> **The extract/rebuild loses something the system needs**, and the samgr replacement is
+> not what broke the boot.
+
+The most likely loss is **SELinux xattrs**: `fsck.erofs --extract` writes none (verified
+with `os.listxattr`: no attributes at all on `system/bin/samgr`, `system/bin/init`,
+`system/etc/passwd`), while the OEM image was built with erofs features
+`sb_csum mtime xattr_filter 0padding` and the kernel logs show init loading label files
+before starting services.
+
+### P.4 How to do it properly next time
+
+* mount the image with `erofsfuse` and copy with `cp -a --preserve=all` (keeps xattrs), or
+* use the OEM's own `mkfs.erofs` options (`-E sharexattr`, matching `lz4_max_distance`,
+  the same inode layout), or
+* avoid rebuilding altogether: patch the file **in place** inside the erofs - the
+  replacement must then be no larger than the original's on-disk footprint, which is why
+  the probe binary was made small.
+
+The original super image is restored on the device, and both the modified
+(`super_hmos_mod.img`) and control (`super_hmos_ctrl.img`) images are kept on disk for
+the next attempt.
