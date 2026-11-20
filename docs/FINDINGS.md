@@ -2113,3 +2113,48 @@ So the difference is not (only) xattrs.  The remaining candidates, in order:
 Until one of those is resolved, **the system partition cannot be modified** - which also
 means the samgr replacement cannot be delivered that way, and the overlay route remains
 blocked by init's own mount.
+---
+
+## Appendix Q - reference: a working GKI-2.0 port (Xiaomi 14 / SM8650)
+
+A public post by 我最帅哈哈哈 (Coolapk, feed/74782449) documents **HarmonyOS 6.0.0.12
+running on the Xiaomi 14 "houji" (SM8650)** - the same GKI 2.0 generation as our device,
+and the same class of hardware.  Working there: **baseband data, Bluetooth, Wi-Fi, GPU
+(Vulkan), battery, sound**.
+
+The author states how it is done, and it directly contradicts the route this project has
+been taking:
+
+> 全体（对内核的扩展的支持，不支持的特性，用户态组件的补丁和绕过）这些东西的实现，
+> **全部是通过在 init_boot 和 vendor_boot 这两个分区里面实现的**，包括热补丁、驱动补丁、
+> 重编的修改的驱动、各种和用户态的垫片
+
+i.e. **everything - kernel extensions, rebuilt drivers, user-space patches and shims - is
+delivered through the `init_boot` and `vendor_boot` partitions**, not by modifying the
+system image.
+
+### Q.1 Consequences for this port
+
+1. **Our 16-second power-off when flashing a rebuilt system image is expected.**  The
+   system partition is integrity-checked; it is not meant to be modified.  The working port
+   does not touch it either.
+2. **The ramdisk is the right place for user-space patches** - and it is the one part of
+   the boot that we already control completely.
+3. The specific hole we hit - HarmonyOS init re-mounting the system and thereby discarding
+   our overlay - is something a working port must also have solved, and the only lever
+   inside the ramdisk is **the init binary itself**, which our ramdisk contains.
+4. The author also notes the port needs **GPT changes** (extra partitions for space) and has
+   no boot animation, no scheduler/thermal - i.e. it is a shim-style port like ours.
+
+### Q.2 Suggested direction
+
+* patch the **init binary in the ramdisk** (it is a file we ship) so that it does not
+  re-mount the system over our overlay, or so that it accepts our replacements;
+* keep delivering kernel-side work as **modules in vendor_boot** (already proven here:
+  `access_tokenid.ko`, `kmsgdump.ko`);
+* keep the system image **pristine** - treat any modification of it as unsupported, which
+  matches both our experiment and the reference port.
+
+The reference package is distributed via Google Drive and China Mobile Cloud
+(`yun.139.com/shareweb/#/w/i/2yA8zDV177t8r`); its init_boot/vendor_boot contents would
+show the concrete shims.
