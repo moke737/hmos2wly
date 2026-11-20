@@ -1730,3 +1730,90 @@ no software channel on this device can show why.
 
 The one thing every guide assumes - a serial console on `ttyMSM0` - is the one thing this
 port does not have.
+---
+
+## Appendix M - the overlay discovery: every earlier userspace "fix" was being discarded
+
+This is the most important structural finding since Appendix J, and it invalidates the
+results of several earlier experiments.
+
+### M.1 What was wrong
+
+All our userspace patches were made by **bind-mounting a file over a path inside /usr**
+(the supplemented `passwd`, the `samgr` wrapper).  They appeared to succeed - `mount()`
+returned 0 and our init logged it - but they never took effect.
+
+The reason is in HarmonyOS's own log:
+
+```
+[pid=1][Init][ERROR][switch_root.c:121]Failed to mount moving /usr/system/bin/samgr to /usr/usr/system/bin/samgr, err = 2
+```
+
+HarmonyOS init performs a **switch_root to /usr** and a *usr-merge* (mount-moving files
+into `/usr/usr/...`).  Both discard over-mounts that sit on top of the old `/usr`, so every
+bind-mounted patch silently vanished at hand-over time.  The scripts and the patched passwd
+were simply never visible to the running system - which is why "samgr wrapper did not run"
+and "passwd fix did not help" were observed.
+
+### M.2 The overlay replacement
+
+The stock kernel has `CONFIG_OVERLAY_FS=y`, so init now builds a real filesystem instead:
+
+```
+mount /dev/block/dm-0 /lower erofs ro
+mkdir /data/upper /data/work
+   /data/upper/system/etc/passwd              (stock + samgr:5555 and friends)
+   /data/upper/system/bin/samgr               (replacement)
+   /data/upper/system/bin/samgr.real          (the original binary)
+   /data/upper/system/lib64/libsetctx.so      (LD_PRELOAD interposer)
+mount -t overlay overlay -o lowerdir=/lower,upperdir=/data/upper,workdir=/data/work /usr
+```
+
+Verified working on the device:
+
+```
+overlay: lower (erofs) at /lower
+overlay: step2 mkdir
+overlay: step3 passwd
+overlay: read passwd 4096 bytes
+overlay: patched passwd in upper layer
+overlay: samgr wrapper installed
+overlay: /usr is now an overlay (lower=erofs, upper=/data/upper)
+```
+
+### M.3 ...and yet init still does not execute the replacement
+
+Three independent stand-ins were tried in the overlay, each with a marker file in a
+world-writable `/data/wrap`:
+
+1. a shell script (`#!/system/bin/sh`, `exec samgr.real`)   -> no marker
+2. the same script at `/usr/usr/system/bin/samgr` too      -> no marker
+3. a **native static binary** (634 344 B) that writes a marker and `execv`s the real
+   binary (608 584 B)                                      -> no marker
+
+The image layout was dumped from inside the device:
+
+```
+/lower:
+  bin -> /system/bin        (absolute symlink)
+  system/                   (the real tree; /lower/system/bin/samgr exists)
+  chip_prod chipset config cust eng_* etc init lib ...
+  (there is NO usr/ directory in the image)
+```
+
+So the image presents the system as `/system/bin/...`, and init - after its own
+switch_root - ends up executing the **real** samgr rather than the overlay copy.  Which
+exact path it resolves was going to be answered by forking a watcher that reads
+`/proc/1/root` and `/proc/1/mountinfo` 40 s after hand-over, but the watcher produced no
+output: it was either killed by init's process cleanup or its logdump writes were blocked.
+
+### M.4 Consequences
+
+* Everything reported before this appendix about "fix applied but no effect" for
+  **passwd** and the **samgr wrapper** must be re-read as "fix was discarded".
+* The **access_tokenid module** is unaffected (it is a kernel module - it really loaded),
+  and so is every `rlog`/logdump observation.
+* The overlay itself works; what is missing is knowing the path HarmonyOS init uses for
+  service binaries after its switch_root.  The next session should get that from
+  `/proc/1/mountinfo` (dump it with a process that init will not reap - e.g. `setsid`
+  plus `nohup`, or write from a kernel thread via a small module instead of userspace).
