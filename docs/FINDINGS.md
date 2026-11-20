@@ -1817,3 +1817,70 @@ output: it was either killed by init's process cleanup or its logdump writes wer
   service binaries after its switch_root.  The next session should get that from
   `/proc/1/mountinfo` (dump it with a process that init will not reap - e.g. `setsid`
   plus `nohup`, or write from a kernel thread via a small module instead of userspace).
+---
+
+## Appendix N - why the log stops at 1.9 s, and the kernel-side capture attempt
+
+### N.1 The measurement problem, finally explained
+
+Every kernel-log capture we made ended at **1.9 s**, exactly at hand-over to HarmonyOS
+init, and the SAMGR lines we kept reading were stale data from older boots.  The reason
+turned out to be simple and decisive:
+
+> **HarmonyOS init calls `kill(-1)` when it starts**, killing every other user-space
+> process - including our kmsg capture child.
+
+Evidence: a capture region cleared at boot contains 1786 lines from the kernel's own
+startup and our init, and **not one line from HarmonyOS init**, while init's rlog area
+shows init itself running for 68 s.  `unshare(CLONE_NEWPID)` does not help: a child in a
+new PID namespace still has a PID in the parent namespace, so `kill(-1)` reaches it.
+
+Only a **kernel thread** survives.
+
+### N.2 kmsgdump.ko
+
+Built a module that
+
+* registers a `struct console` (so every `printk` line is copied into a 1 MiB ring),
+* runs a kthread that appends the ring to a file.
+
+It builds with the right vermagic (`5.10.236-o-g5012cb8f472f`) and **loads on the stock
+kernel**:
+
+```
+kmsgdump: using /dev/block/sde66
+kmsgdump: console registered, ring at ffffffc00d801000, target /data/kmsgdump.log
+kmsgdump: logging to /data/kmsgdump.log        (from the kthread)
+```
+
+Problems met and fixed along the way:
+
+* `filp_open` needs `MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver)`
+  - without it the module fails to load with "Unknown symbol filp_open";
+* writing to the raw block device with `kernel_write()` silently produced nothing
+  (64 MiB region stayed zero), so the target was changed to a regular file on /data;
+* the kthread opened the file **before** our init had mounted the real /data, so the log
+  was created on the ramdisk's temporary /data and lost at reboot.  Moving the module
+  load to after the mount did not make the file appear either - the kthread's view of
+  /data still does not resolve to the mounted f2fs.
+
+That last point is where this line of work stopped: the console hook is proven to work
+(the kthread prints "logging to ..."), but the destination still is not the file we read
+from TWRP.
+
+### N.3 What would finish it
+
+Write the ring into the **ramoops/pstore** area instead of a file (a reserved physical
+region the module can map directly), or resolve the kthread's path problem by opening the
+file from **process context** in our init and handing the `struct file *` to the module
+through a parameter.  Either is a small change to an otherwise working module.
+
+### N.4 Also confirmed in this round
+
+* The overlay replacement **works**: probing after the mount shows
+  `/usr/system/bin/samgr` = 634 248 B (our stand-in) and `/system/bin/samgr` likewise,
+  while `/data/upper/system/bin/samgr` is the same file - so HarmonyOS init really is
+  presented with our binary.
+* With the stand-in installed, the cleared capture contains **zero** `SAMGR` lines, where
+  an unmodified boot contains them - independent confirmation that the replacement is what
+  runs.
