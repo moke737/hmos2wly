@@ -1985,3 +1985,30 @@ like "stale data" and were dismissed at the time.
 **Consequence for the port**: after the hand-over, the kernel log on this system is
 inherently unavailable by design.  Any further diagnosis of samgr has to come from the
 user-space side (its stderr, `/data/log`, or a modified samgr), not from the kernel.
+### O.6 Why the overlay replacement never runs
+
+The overlay itself is proven: probing immediately after mounting it shows
+`/usr/system/bin/samgr` and `/system/bin/samgr` both serving **our** 634 248-byte binary,
+while the stock one is 608 584 bytes.
+
+Yet three different stand-ins (shell script, `exec`-and-inject binary, environment-probing
+binary that also sleeps) never run: no marker file appears in `/data/wrap`, and the
+`/data` traversal problem was fixed (`0771`).
+
+The remaining explanation is the same class of problem as the switch_root finding:
+
+> **HarmonyOS init mounts the system partition itself, after our overlay is in place.**
+> Its `switch_root.c` messages ("Failed to mount moving /usr/system/bin/samgr to
+> /usr/usr/system/bin/samgr") show it manipulating exactly those paths.  When it mounts
+> the erofs image over the mount point, our overlay - which sits *above* that mount point -
+> is shadowed, and init then executes the original binary.
+
+That is why the file we can `stat` at 1.8 s is not the file init runs at 27 s.  Confirming
+it needs init's own mount list (`/proc/1/mountinfo`), and every attempt to read it from a
+user-space helper failed because init kills all other processes at start-up (Appendix N).
+
+**What would settle it**: neutralise the mount source instead of the mount point - for
+example make the `super` logical partition's `system` extent expose an image we control
+(we already generate the super image with `build_lp.py`), or replace the fstab used by
+init.  Both are image-level changes, not boot-ramdisk changes, and are the natural next
+step for this port.
