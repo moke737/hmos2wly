@@ -2158,3 +2158,77 @@ system image.
 The reference package is distributed via Google Drive and China Mobile Cloud
 (`yun.139.com/shareweb/#/w/i/2yA8zDV177t8r`); its init_boot/vendor_boot contents would
 show the concrete shims.
+---
+
+## Appendix R - the 15-second power-off, and the LP geometry that was never there
+
+### R.1 The power-off was our own code
+
+Every image from v116 onwards powered off after 13-15 s.  The cause was in our own init:
+
+```c
+static void fail_stage(int stage)
+{
+	klog("FAIL at stage %d -> power off in %ds", stage, 10 + stage);
+	sync();
+	sleep(10 + stage);
+	reboot(RB_POWER_OFF);      /* <- this */
+	for (;;) pause();
+}
+```
+
+A single-stage test proved the boot chain was healthy: a ramdisk whose `/init` is a five-line
+shell script ran and stayed alive indefinitely.  So the kernel, boot image and ramdisk were
+fine all along - our C init was terminating the system because of an internal failure.
+
+### R.2 The failure itself
+
+`fail_stage()` now records the stage and stays alive, and `map_super()` reports its own
+failure points into the persistent rlog instead of only kmsg.  That gave:
+
+```
+MAP: bad geometry magic 0x00000000 (want 0x616c4467) size=0 slots=0
+======== FAIL STAGE 2 ========
+```
+
+Reading the device confirms it:
+
+```
+super @ 0x1000 (LP geometry):   00 00 00 00 ...   <- absent
+super @ 0x3000 (LP header):     30 50 4c 41 ...   <- "LPMA", intact
+```
+
+**Our own super image has no LP geometry block.**  It was produced by `tools/make_sparse.py`,
+which writes the metadata header and the six images but never the geometry.  Our init had
+been taught to require the geometry (a later hardening change) and therefore refused to map
+anything.
+
+The fix is a fallback: if the geometry magic is absent, use the liblp defaults
+(`metadata_max_size = 65536`, `metadata_slot_count = 2`) and continue, since the header at
+0x3000 carries everything that is actually needed.
+
+### R.3 Result
+
+With that one change the whole pipeline runs again:
+
+```
+geo: slots=2 max_size=65536 parts=17 hdr=256
+dm system -> dm-0 ... dm patch -> dm-5      (six partitions mapped)
+map ok, system_minor=0
+mounting /dev/block/dm-0 at /usr
+token: module loaded from /access_tokenid.ko
+binderfs mounted
+mounted dm-2 at /vendor (erofs)
+mounted /dev/block/sda14 at /data (f2fs)
+```
+
+The device is back to a boot cycle of about 34 s (logo 17 s, black 17 s) instead of the
+15-second power-off.
+
+### R.4 Two measurement lessons from this round
+
+1. `rlog` at offset 4096 is **overwritten by the OEM `op_kernel_log` module**; it must live
+   somewhere else (this port now uses 128 MiB).
+2. Uninitialised areas of `logdump` contain **decades-old flash residue**, so a log must
+   always begin with a marker written in the current boot, or it will be misread (that is
+   what produced the "stale SAMGR lines" confusion in Appendix N).
