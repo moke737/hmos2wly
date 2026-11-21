@@ -2358,3 +2358,57 @@ Next steps, in order:
    is readable from a non-root uid, and whether `/data/log` is writable by it;
 3. once HarmonyOS logs are readable, samgr's actual error will be visible and the boot
    detector can stop firing.
+---
+
+## Appendix U - the kernel side of the port is complete
+
+A decisive experiment closes the question of where the remaining failures are.
+
+### U.1 The state of every kernel-side component
+
+With the checkpoint file (`/data/init_state.txt`) and the three OpenHarmony modules in the
+ramdisk, a full boot now records:
+
+```
+A: mounts done                          <- six dm devices, erofs + f2fs mounted
+F: passwd patched                       <- the parameter-DAC passwd fix
+H: hilog module rc=0                    <- OpenHarmony hilog driver
+H: /dev/hilog major=505 (EXISTS)        <- its device node
+I: binder rc=0                          <- OpenHarmony binder driver
+I: binder node created                  <- /dev/hmos_binder
+I: /dev/binder -> hmos_binder           <- HarmonyOS's own binder is what libipc sees
+G: about to exec                        <- hand-over to HarmonyOS init
+```
+
+**Every kernel-side step succeeds, on every boot**, and the device still resets after
+~34 s (17 s logo, 17 s black).
+
+### U.2 What this rules out
+
+The reset is therefore **not** caused by:
+
+* the super mapping or the missing LP geometry (fixed in Appendix R);
+* the mounts, the erased /data or the passwd patch (all verified);
+* the absent access-token device (present);
+* the missing HarmonyOS binder ioctls (OpenHarmony's own binder is loaded and wired);
+* the missing /dev/hilog (present, dynamic major 505).
+
+**The kernel side of this port is finished.**  What remains happens inside HarmonyOS's own
+userspace, which is exactly the layer the reference port handles with its `stage_*_patch`
+scripts: byte-level patches of system libraries, verified by sha256 and delivered with
+bind mounts from the ramdisk.
+
+### U.3 The two pieces of work that remain
+
+1. **use the OpenHarmony token driver instead of the stand-in** - v141 still loads the
+   stand-in; the official one was compiled and loads fine in isolation (Appendix S), but the
+   first attempt to combine all three modules produced an init that wrote no checkpoints at
+   all, so the combination needs to be introduced one module at a time with checkpoints.
+2. **port the userspace shims** - the reference port patches specific libraries (display,
+   render service, time service, ...) with `dd` deltas and mounts them over the originals
+   from inside the ramdisk.  Each of those requires the identifying bytes from *our* system
+   image, so they cannot be copied from the houji package - they have to be derived from our
+   own binaries with the same method.
+
+**What cannot help any more**: adding kernel modules, changing the ramdisk's mount layout,
+or touching the boot cmdline.  All of those have been verified end to end.
