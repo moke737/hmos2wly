@@ -2542,3 +2542,48 @@ fails with `invalid de[0].nameoff 0 @ nid 20888320`, and `/vendor` on the device
    load them exactly as it loads the token/binder/hilog modules.
 5. With `/dev/kgsl-3d0` (and the DRM nodes) present, `render_service` has a chance, which is
    the precondition for ever passing the critical-service check.
+## Appendix X - the kernel-log channel works, and msm_drm is the real display driver
+
+### X.1 We can finally read the kernel log during module load
+
+The init now reads `/dev/kmsg` from its own process **after** loading the modules and before
+the hand-over, and writes the result to `/data/kmsg_gpu.txt` (148 KB on the last boot).  This
+is the diagnostic channel the project lacked for its first 70 hours: unlike a userspace
+daemon it is not killed, and unlike the earlier kmsg relay it runs *after* the interesting
+events.
+
+### X.2 What it shows
+
+`msm_kgsl.ko` loads **without a single error and without a single message** - it is a library
+used by the display driver, not a standalone GPU device.
+
+`msm_drm.ko` fails with a clean, complete list of unresolved symbols:
+
+```
+msm_drm: Unknown symbol altmode_register_notifier / altmode_register_client / altmode_send_data
+msm_drm: Unknown symbol dwc3_msm_set_dp_mode
+msm_drm: Unknown symbol fsa4480_switch_event / fsa4480_reg_notifier
+msm_drm: Unknown symbol hdcp1_init / hdcp1_start / hdcp2_init / hdcp2_open_stream ...
+msm_drm: Unknown symbol mmrm_client_register / mmrm_client_set_value ...
+```
+
+Every one of those symbols lives in a module that failed to load earlier:
+`altmode-glink`, `dwc3-msm`, `fsa4480-i2c`, `hdcp_qseecom`, `msm-mmrm`.  Those in turn need
+their own dependencies.  It is a **cascade**, not a fundamental incompatibility.
+
+### X.3 The fix
+
+Load **all 380 modules** in the stock `modules.load` order instead of a 37-module closure.
+154 MB does not fit in a ramdisk, but it does not have to: the modules can live in
+`/data/dlkm/` and be loaded **after** `/data` is mounted (the closure loader currently runs
+before the f2fs mount, which is why it only had a partial set).
+
+Order of operations for the next build:
+
+1. extract every module from `vendor_dlkm.img` into `/data/dlkm/` (once, from the host);
+2. move the module-loading call to after `mount_vendor_and_data()`;
+3. load `modules.load` in order, with the firmware path already set to `/firmware`;
+4. capture `/dev/kmsg` again and look for `msm_drm` probe messages and the DRM nodes.
+
+With `msm_drm` probing, the display path exists for the first time - and that is the
+precondition for `render_service`, which is the critical service gating the whole boot.
