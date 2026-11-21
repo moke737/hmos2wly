@@ -2438,3 +2438,58 @@ That is the phase this port now enters.  The kernel side is finished and verifie
 remaining work is to identify, in *our* system image, which libraries need which bytes
 changed - and for that the reference port only provides the method, not the answers, because
 the binaries differ.
+## Appendix V - the real cause of the 34-second reset: HarmonyOS's critical-service policy
+
+The OpenHarmony init configuration was extracted from the device (`/data/ohcfg`, 2128 files,
+57 MB) and it answers the question this project has been chasing since the beginning.
+
+### V.1 Critical services
+
+Ten services carry `"critical"`, and HarmonyOS init **reboots the whole system** when one of
+them keeps failing.  The two that matter here:
+
+```json
+{ "name": "samgr",
+  "critical": [1, 1, 60],
+  "uid": "samgr",
+  "file": ["/dev/kmsg rd 0660 root system"],
+  "bootevents": "bootevent.samgr.ready" }
+
+{ "name": "render_service",
+  "critical": [1, 5, 60],
+  "uid": "graphics",
+  "bootevents": ["bootevent.renderservice.ready"] }
+```
+
+`render_service` additionally needs **`/dev/mali0`** (the GPU), created by the `graphic.cfg`
+`init` job with `chmod 666 /dev/mali0` / `chown system graphics`.
+
+The full critical set is: `access_token`, `accountmgr`, `appspawn`, `foundation`, `graphic`,
+`param_watcher`, `privacy`, `samgr_standard`, `storage_daemon`, `storage_manager`.
+
+**A critical service that exhausts its restart budget makes init call `Reboot()`.**  That is
+the ~34 s cycle: the system boots, the framework fails to come up, and init resets it.
+
+### V.2 What this means for the port
+
+1. `/dev/mali0` cannot exist yet - the GPU firmware and the display path are not ported, and
+   `/dev/mali0` comes from the vendor kernel module `mali_kbase`, which the stock kernel does
+   not have built in and which we have not built as a module.
+2. So `render_service` is a hard gate: **without GPU support the system cannot pass the
+   critical-service check**, no matter how correct the mounts, modules and accounts are.
+
+This explains why every kernel-side fix produced exactly the same 34 s cycle, and why the
+reference port invests so heavily in display assets (`chip_prod/houji_assets/display/*`,
+`libdisplay_buffer_vdi_impl_qcom.so`) and in whole `display_manager_config` overrides.
+
+### V.3 The two concrete next steps
+
+1. **`/dev/kmsg` permissions**: `samgr` wants `rd 0660 root system`.  Our init creates it
+   0600; fix that and samgr gets one requirement closer.
+2. **GPU**: build `mali_kbase` (or find the vendor module) as a loadable module for this
+   kernel, so `/dev/mali0` exists and `render_service` has a chance.  The OnePlus 10 Pro is
+   SM8450/Adreno 730; the vendor module must match the stock kernel's vermagic, the same way
+   the token/binder/hilog modules now do.
+
+Everything else the framework needs - the OpenHarmony token device, the OpenHarmony binder
+and `/dev/hilog` - is already in place and verified (Appendix S and T).
