@@ -2232,3 +2232,84 @@ The device is back to a boot cycle of about 34 s (logo 17 s, black 17 s) instead
 2. Uninitialised areas of `logdump` contain **decades-old flash residue**, so a log must
    always begin with a marker written in the current boot, or it will be misread (that is
    what produced the "stale SAMGR lines" confusion in Appendix N).
+---
+
+## Appendix S - BREAKTHROUGH: HarmonyOS's own binder and token drivers now load on the stock kernel
+
+This is the step the whole port depended on and it now works.
+
+### S.1 What was learned from the reference package
+
+The Xiaomi 14 port ships a kernel module, embedded as base64 inside its 3937-line shell
+`init`, described as:
+
+```
+Ace5 OpenHarmony token device and isolated Binder transport
+parm: token_device, devices
+```
+
+It provides `/dev/access_token_id` **and** `hmos_binder` / `hmos_hwbinder` /
+`hmos_vndbinder` in one module.  That is how a HarmonyOS port on a stock GKI kernel gets
+the IPC semantics HarmonyOS expects: **it does not patch the built-in binder - it supplies
+its own, under different device names**, and points `/dev/binder` at it.
+
+### S.2 The port
+
+From `OpenHarmony/kernel_linux_5.10` (`git clone https://gitee.com/open_ohos/kernel_linux_5.10`):
+
+* `drivers/accesstokenid/access_tokenid.c` (407 lines) - the official token device.  It only
+  depended on `task_struct::token`/`::ftoken`, which a stock 5.10 kernel does not have, so
+  those four accesses were replaced by a pid-keyed hash table.  Everything else (the
+  permission bitmaps, the ioctl set) is untouched.
+
+* `drivers/android/binder.c` + `binder_alloc.c` - HarmonyOS's binder, built as
+  `binder_linux.ko`, with every dependency the stock kernel does not export removed:
+
+| missing symbol | replacement |
+|---|---|
+| `security_binder_transaction` / `_transfer_binder` / `_transfer_file` / `_set_context_mgr` | allow (return 0) |
+| `init_binderfs` / `binderfs_create_file` / `binderfs_remove_file` / `is_binderfs_device` | binderfs dropped; module creates its own misc devices |
+| `close_fd_get_file`, `task_work_add` | the binderfs-only deferred-close machinery removed |
+| `zap_page_range` | `zap_vma_ptes` (exported) |
+| `can_nice` | `capable(CAP_SYS_NICE)` |
+| `__wake_up_pollfree` | `wake_up_interruptible` |
+
+Two further fixes were needed after the first successful link: `binder.c` and
+`binder_alloc.c` both declare a module parameter called `debug_mask` (renamed the
+allocator's to `alloc_debug_mask`), and the device-creation block is guarded by
+`!IS_ENABLED(CONFIG_ANDROID_BINDERFS)` - since this kernel **has** binderfs, the module
+created no devices until that guard was removed.
+
+### S.3 Verified on the device
+
+In TWRP, on the stock kernel:
+
+```
+insmod access_tokenid.ko   -> lsmod: access_tokenid  28672 0
+/sys/class/misc/access_token_id
+insmod binder_linux.ko devices=hmos_binder,hmos_hwbinder,hmos_vndbinder
+                           -> lsmod: binder_linux  331776 0 [permanent]
+/sys/class/misc/hmos_binder, hmos_hwbinder, hmos_vndbinder
+```
+
+And in the real boot (persistent rlog at 128 MiB):
+
+```
+MOD: /access_tokenid.ko loaded ok
+MOD: /binder_linux.ko loaded ok
+NODE: /dev/access_token_id -> 10:120
+NODE: /dev/hmos_binder -> 10:119
+NODE: /dev/hmos_hwbinder -> 10:118
+NODE: /dev/hmos_vndbinder -> 10:117
+NODE: /dev/binder -> /dev/hmos_binder
+```
+
+Both modules carry `vermagic=5.10.236-o-g5012cb8f472f`, exactly the stock kernel's.
+
+### S.4 What it did and did not fix
+
+The boot cycle is still ~34 s, so samgr's abort is **not** caused only by the missing
+binder ioctls.  The next known missing piece is the **kernel half of hilog** - every
+HarmonyOS library prints `HiLogAdapter_init: Can't connect to server`, and
+`drivers/staging/hilog` from the same OpenHarmony tree provides `/dev/hilog`.  That is the
+obvious next module to build, using exactly the same procedure.
