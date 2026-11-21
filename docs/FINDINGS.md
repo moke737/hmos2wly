@@ -2412,3 +2412,29 @@ bind mounts from the ramdisk.
 
 **What cannot help any more**: adding kernel modules, changing the ramdisk's mount layout,
 or touching the boot cmdline.  All of those have been verified end to end.
+### U.4 Third confirmation: user space cannot be observed after hand-over
+
+A monitor process forked by our init, which would have written the process list, the hilog
+ring and dmesg into `/data/monitor.txt` at t+2/5/8/12/18 s, produced **no file at all**.
+Together with the earlier failures (userspace kmsg reader, PID-namespace trick) this is the
+third independent confirmation:
+
+> **HarmonyOS init terminates every process that is not its own, so nothing of ours can
+> observe the system after the hand-over.**
+
+### U.5 The closed loop, and the only way through it
+
+* to see inside HarmonyOS we need **hilog**, because the kernel log is quieted (Appendix O)
+  and user-space monitors are killed (this appendix);
+* hilog only carries data if **hilogd** runs, which is a HarmonyOS user-space service;
+* hilogd does not run, and without logs there is nothing to diagnose.
+
+The reference port breaks this loop the only way it can be broken: **it does not diagnose
+afterwards, it patches beforehand** - its 3937-line shell init applies byte-level patches to
+the system libraries and bind-mounts them into place *before* the hand-over, so the system
+starts already fixed.
+
+That is the phase this port now enters.  The kernel side is finished and verified; the
+remaining work is to identify, in *our* system image, which libraries need which bytes
+changed - and for that the reference port only provides the method, not the answers, because
+the binaries differ.
