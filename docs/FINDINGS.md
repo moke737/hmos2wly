@@ -2313,3 +2313,48 @@ binder ioctls.  The next known missing piece is the **kernel half of hilog** - e
 HarmonyOS library prints `HiLogAdapter_init: Can't connect to server`, and
 `drivers/staging/hilog` from the same OpenHarmony tree provides `/dev/hilog`.  That is the
 obvious next module to build, using exactly the same procedure.
+## Appendix T - three OpenHarmony kernel modules working, and a reliable checkpoint channel
+
+### T.1 The modules
+
+Built from `OpenHarmony/kernel_linux_5.10` and loading on the stock 5.10.236 GKI kernel:
+
+| module | source | notes |
+|---|---|---|
+| `access_tokenid.ko` | `drivers/accesstokenid/access_tokenid.c` | task_struct token fields replaced by a pid-keyed hash table; exports `oh_task_get_token/ftoken` for binder |
+| `binder_linux.ko` | `drivers/android/binder.c` + `binder_alloc.c` | 13 unexported dependencies replaced (see Appendix S); creates `hmos_binder/…` devices via the `devices=` parameter |
+| `hilog.ko` | `drivers/staging/hilog/hilog.c` | hard-coded major 245 is taken on this platform, so it now allocates a dynamic major (505 at runtime) |
+
+### T.2 A checkpoint channel that actually works
+
+rlog proved unreliable and kmsg is cut at 1.85 s, so the init now appends checkpoints to
+**`/data/init_state.txt`** - plain f2fs writes.  A full boot produces:
+
+```
+A: mounts done
+F: passwd patched
+H: hilog module rc=0
+H: /dev/hilog major=505 (EXISTS)
+G: about to exec
+```
+
+**This proves our side of the port is complete**: super geometry fallback, six dm devices,
+erofs/f2fs mounts, module loads, device nodes and the hand-over all succeed, every boot.
+Everything that still fails happens **inside HarmonyOS init**.
+
+### T.3 What is still missing
+
+`hilogd` does not write into `/data/log/hilog` even though `/dev/hilog` exists, and the
+system still resets ~17 s after init starts.  `/data/service` does appear, so HarmonyOS's
+parameter service is running; the logging service is not.
+
+Next steps, in order:
+
+1. combine all three modules with the checkpointed init (v139 had only the stub token
+   driver plus hilog) and confirm `/dev/hilog`, `/dev/binder` and `/dev/access_token_id`
+   are all present at hand-over;
+2. find out why `hilogd` produces nothing: check whether the service is started at all
+   (init's own rlog output records `ServiceStart started info hilogd`), whether the device
+   is readable from a non-root uid, and whether `/data/log` is writable by it;
+3. once HarmonyOS logs are readable, samgr's actual error will be visible and the boot
+   detector can stop firing.
