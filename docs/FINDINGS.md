@@ -2493,3 +2493,52 @@ reference port invests so heavily in display assets (`chip_prod/houji_assets/dis
 
 Everything else the framework needs - the OpenHarmony token device, the OpenHarmony binder
 and `/dev/hilog` - is already in place and verified (Appendix S and T).
+## Appendix W - the GPU is the gate, and the vendor partition is damaged
+
+### W.1 The critical-service gate
+
+From the extracted init configuration (Appendix V), HarmonyOS init reboots the device when a
+`"critical"` service keeps failing.  Two of the ten matter for us:
+
+* `samgr` - `critical: [1, 1, 60]`, wants `/dev/kmsg rd 0660 root system`;
+* `render_service` - `critical: [1, 5, 60]`, wants `/dev/mali0` (GPU).
+
+**`render_service` cannot start without the Adreno kernel driver, so no amount of mount or
+account fixing will stop the 34 s reboot until the GPU works.**
+
+### W.2 The modules exist in the stock package
+
+The ColorOS 17.0.0.155 package (`NE2210_17.0.0.155_20261024_FishAn.zip`) contains
+`images/vendor_dlkm.img` (154.5 MB, ext4) holding 380 modules, including:
+
+```
+msm_kgsl.ko          3,071,152 bytes   Adreno GPU driver
+msm_drm.ko           8,113,096 bytes   display driver
+msm_ext_display.ko      27,848 bytes
+gpucc-diwali.ko / gpucc-waipio.ko      GPU clock controllers
+modules.dep / modules.load             the full load order
+```
+
+`msm_kgsl.ko` needs `msm_performance`, `mdt_loader`, `oplus_mm_kevent{,_fb}`; `msm_drm.ko`
+needs 34 more.  All of them are in the same image and were built for exactly this kernel,
+so their vermagic matches by construction.
+
+### W.3 But this device has no vendor_dlkm partition
+
+`/dev/block/by-name` on the phone lists `super`, `boot_a/b`, `vendor_boot_a/b`,
+`vm-bootsys_a/b`, `vbmeta_vendor_a/b` - **there is no `vendor_dlkm`**.  The running
+ColorOS base (16.0.3.x) keeps its modules in `vendor/lib/modules` instead.
+
+And **our `vendor` partition is damaged**: `fsck.erofs --extract` on the extracted region
+fails with `invalid de[0].nameoff 0 @ nid 20888320`, and `/vendor` on the device mounts
+(erofs, rc=0) but contains no `lib/modules` at all.
+
+### W.4 The concrete repair
+
+1. Take the **matching** ColorOS package for this device (16.0.3.520 or .530 are on disk).
+2. Extract its `images/vendor.img`.
+3. Write that file back into the super's `vendor` LP partition.
+4. Then `/vendor/lib/modules/msm_kgsl.ko` and the DRM stack exist again, and our init can
+   load them exactly as it loads the token/binder/hilog modules.
+5. With `/dev/kgsl-3d0` (and the DRM nodes) present, `render_service` has a chance, which is
+   the precondition for ever passing the critical-service check.
