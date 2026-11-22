@@ -2690,3 +2690,67 @@ sources that ship these functions (`msm_minidump`, `qcom_scm`, the OPlus BSP pat
 With `qcom_wdt_core.ko` loaded, its own kernel thread pets the PMIC watchdog and the hard
 reset disappears - at which point HarmonyOS finally gets more than 30 seconds to boot, and
 the real userspace work can begin.
+## Appendix AA - THE REBOOT IS GONE (the single biggest step of the project)
+
+### AA.1 What was happening
+
+Every previous build reset the device 34-36 seconds after power-on, which made the whole
+port unobservable.  The cause was finally isolated to **HarmonyOS init itself**:
+
+* the PMIC watchdog is *not* responsible - `gh-watchdog`, `watchdogd` and `khungtaskd` all
+  exist in the running kernel (`W: kthread gh-watchdog=1 watchdogd=1 khungtaskd=1`);
+* the bootloader's `oplusboot.startupmode=hard_reset` only records that the SoC was reset;
+* dropping the critical-service flags, pre-satisfying boot events and creating
+  `/dev/watchdog` each changed the timing by at most +2 s, so none of them was the trigger;
+* TWRP runs indefinitely on the same kernel with the same modules, so the difference is
+  purely in userspace.
+
+The reboot is a plain `reboot()` call from HarmonyOS init.
+
+### AA.2 The fix: patch init's reboot entry points
+
+`/system/bin/init` exports its reboot helpers as dynamic symbols:
+
+```
+0x3a868  InitAddRebootHook       108 bytes
+0x3a8d4  AddRebootCmdExecutor   1040 bytes
+0x29594  ExecReboot              128 bytes
+```
+
+Each one has its first instruction replaced with `ret` (`d65f03c0`), which is a 4-byte patch
+per function and keeps the file size identical:
+
+```
+ExecReboot:            a9be7bfd (stp)  ->  d65f03c0 (ret)
+AddRebootCmdExecutor:  ff8301d1 (sub)  ->  d65f03c0 (ret)
+InitAddRebootHook:     af010090 (adrp) ->  d65f03c0 (ret)
+```
+
+The patched binary ships in the ramdisk and is bind-mounted over `/usr/system/bin/init`
+before the hand-over.
+
+### AA.3 Result
+
+**The device no longer reboots.**  It sits at the OnePlus logo indefinitely, which means the
+kernel, our pre-init and HarmonyOS init are all running and stable - the platform is finally
+observable and iterable.
+
+**This is the milestone the project has been working toward since day one.**  Everything
+before it (super mapping, erofs/f2fs, the OpenHarmony token device, binder, hilog, 377 stock
+modules, the Adreno GPU and DSI display path) was necessary but pointless while the machine
+was being reset every 36 seconds.
+
+### AA.4 What is left
+
+The system stops at the logo, i.e. HarmonyOS's services are not coming up.  The diagnostic
+we tried to inject (`zz_diag.cfg`, a service running a static binary that would dump
+processes, mounts and dmesg into `/data/diag.txt`) was **installed** (`J: zz_diag.cfg
+installed (314 bytes)`) but **never started**, so init rejects it for a reason we cannot see
+yet - most likely a grammar strictness in the 5.x init config parser.
+
+Next steps, in order of value:
+
+1. make the injected service actually run (try `start-mode: "condition"` plus an explicit
+   `start zzdiag` from a job, or register it as a `hdf_devhost` style helper);
+2. with the dump in hand, identify which service fails and why;
+3. then port the reference port's `stage_*_patch` approach to our own libraries.
