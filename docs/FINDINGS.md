@@ -3191,3 +3191,49 @@ The next session may want to try `syncfs(fd)` on specific filesystems instead of
 | **`sync()` hang found** | **yes - Appendix AI** |
 
 Next: remove `sync()`, let the switch run, and observe.
+## Appendix AJ - the packed image is correct but the device runs something else
+
+### AJ.1 The contradiction
+
+A marker string was added to the init binary and verified at every stage:
+
+```
+rd_v205/init contains "MAIN START"       : 1   (the ramdisk directory)
+preinit_v205  contains "MAIN START"      : 1   (the binary itself)
+the packed ramdisk, extracted again      : 1   (rd_v205.lz4 -> cpio -> ./init)
+```
+
+So the boot image that `boot_a` receives is definitively correct.
+
+But after flashing it and booting, the kernel log written by that very init contains
+`hmos-preinit` **10 times** (so our init ran) and `MAIN START` **0 times**.
+
+**The device is not running the image we flash.**
+
+### AJ.2 Why this matters more than anything else tonight
+
+If the device has been running a stale init for the last several builds, then:
+
+* `switch_to_our_root()` may have been called all along, or never - we cannot tell;
+* the `sync()` finding (Appendix AI) may describe a *different* binary than the one we
+  patched after it;
+* every "no effect" result of the last few hours is suspect.
+
+### AJ.3 What to check first, next session
+
+1. in TWRP, delete `/data/kmsg_stock.txt`, boot the freshly flashed image, and see whether the
+   file reappears with a timestamp from *this* boot;
+2. diff the running `/init` against the one in the image: the observer can `open("/init")`
+   and hash the first 4 KB, or simply record `stat("/init")` size - our v205 init is
+   **778032** bytes and every earlier one differs;
+3. check whether the bootloader is picking up `boot_b` instead of `boot_a` (`slot_suffix`);
+4. if the sizes differ, the flash path is the problem - try `fastboot flash boot_a` from
+   fastboot rather than `dd` from TWRP, and verify with `fastboot getvar current-slot`.
+
+### AJ.4 The 95-hour state
+
+Everything in Appendices S-AI stands, but every conclusion drawn from a boot after v196 has to
+be re-checked once we know the device is really running the image we build.
+
+The one concrete, verified fact to build on: **the init we pack is correct, and the string it
+prints is missing at runtime.**
