@@ -2823,3 +2823,55 @@ Not working yet:
 The project is past the point where it was blind and reset every 36 seconds.  It now runs,
 with a working GPU, display driver, SELinux policy and IPC stack; what remains is making
 HarmonyOS's own service layer come up.
+## Appendix AC - final state at 87 hours
+
+### AC.1 What works (all verified on the device)
+
+| component | evidence |
+|---|---|
+| super LP parsing, six dm devices | every boot |
+| erofs `/usr`, f2fs `/data` | checkpoint A |
+| OpenHarmony token / binder / hilog modules | `MOD: ... loaded ok` |
+| 144 first-stage modules from vendor_boot | loaded by Android's first-stage init before ours (`F: FAIL ... -> 17 File exists` for all of them = already present) |
+| 377 vendor_dlkm modules | 264 load, `dri=yes` |
+| Adreno GPU + DSI display | `/dev/dri`, `kgsl-3d0 ... bound ... gmu` |
+| **SELinux policy** | `policyvers=33`, `enforce=0` |
+| **no reboot from init** | `ExecReboot`/`AddRebootCmdExecutor`/`InitAddRebootHook` patched to `ret` |
+| `/system` as a real bind mount | `S: /system is now a bind mount` |
+
+### AC.2 What still does not work
+
+HarmonyOS's service layer does not come up, so there is no boot animation and no display.
+The five blind spots are all the same one: **we cannot see init's decisions.**
+
+Attempts to gain that visibility, and why each failed:
+
+| attempt | result |
+|---|---|
+| diag service in its own cfg (job `exec`, then service, then with `secon`) | installed but never started |
+| diag service in `hmos_init_cust_ext.cfg` | installed but never started |
+| diag service in `init.sched.cfg` (whose jobs demonstrably run) | installed but never started |
+| fork HarmonyOS init as a child and stay PID 1 | the insertion never landed - `execl` sits inside a conditional branch, so `V:` lines never appear |
+
+The last idea is still the right one and is worth finishing: **there are four `execl` call
+sites** in the init (`/system/bin/init` twice, `/usr/system/bin/init`, and `REAL_INIT`), and
+the one that actually executes has not been identified.  Inserting the fork+watch in front of
+*all four*, or replacing the `exec` with a `fork` in each, would give PID 1 back and with it
+the ability to read `/dev/kmsg` and `/proc` while HarmonyOS init runs.
+
+### AC.3 Honest summary
+
+In 87 hours this port went from "does not exist" to:
+
+* a complete boot chain (super, dm, erofs, f2fs, overlay);
+* HarmonyOS's own kernel drivers - token device, binder and hilog - compiled from the
+  OpenHarmony 5.10 tree and loading on a stock GKI kernel, which was the "impossible" part;
+* the Adreno GPU and the DSI display path actually probing;
+* SELinux policy loaded, which had been silently missing the whole time;
+* **and the device no longer reboots**, because `ExecReboot` was patched to `ret`.
+
+What is left is HarmonyOS's userspace: the services must start, and the reference port's
+method for that (byte patches applied before boot, validated by sha256) is fully documented
+in Appendices S-T and its package.
+
+**The one thing to fix first next time is visibility**, not drivers.
