@@ -2965,3 +2965,63 @@ find next.  The two experiments proposed in Appendix AD stand:
    our tmpfs (the observer can `listdir` it and record the result).
 
 With the observer in place both are cheap and give a definitive answer.
+## Appendix AF - THE DEFINITIVE FINDING: HarmonyOS init re-mounts /system over our overrides
+
+### AF.1 The proof
+
+Our init binds `/usr/system` onto `/system` and verifies it at hand-over time:
+
+```
+Y: binding /usr/system onto /system
+Y: /system now bound to /usr/system
+Y: verify usr=63 sys=63 -> MATCH (overrides visible)
+```
+
+A moment later, from inside the running system (the observer of Appendix AD), the same
+file is the **original** again:
+
+```
+>>> /cfgs/watchdog.cfg                       : READABLE (511 bytes)   <- our patched copy
+>>> /usr/system/etc/init/watchdog.cfg        : READABLE (511 bytes)   <- still ours
+>>> /system/etc/init/watchdog.cfg            : READABLE (376 bytes)   <- ORIGINAL
+>>> /usr/system/etc/param/zz_bootevents.para : READABLE (511 bytes)
+>>> /system/etc/param/zz_bootevents.para     : MISSING
+```
+
+**HarmonyOS init re-mounts `/system` itself after we hand over.**  Every service config,
+every boot-event parameter and every library override we place under `/usr/system` is
+therefore invisible to it: it is looking at a different, freshly mounted `/system`.
+
+That single fact explains all of the following:
+
+* `zzdiag` / `wtest` services never start - init never sees their cfgs;
+* `bootevent.*.ready` is never true - init never sees our param files;
+* `ExecReboot` patches in `/usr/system/bin/init` DO take effect - because we bind them by
+  hand right before the exec, which is *after* init's last mount of /system... which is why
+  the reboot patch works while everything else does not.
+
+### AF.2 Why the reference port does not hit this
+
+The reference port does not `exec` into a shared root.  It mounts the HarmonyOS image at
+`/mnt/rootfs`, applies its patches **inside that tree**, and then does
+
+```
+exec /bin/busybox switch_root /mnt/rootfs /system/bin/init --second-stage
+```
+
+After `switch_root`, `/system` **is** the patched tree.  HarmonyOS init can re-mount whatever
+it likes: it re-mounts its own root, which is the patched one.
+
+Our port has always used a plain `exec`, sharing the ramdisk root.  That is the architectural
+mistake, and it is the one thing that has to change.
+
+### AF.3 What to do next session
+
+1. build the HarmonyOS root at `/mnt/rootfs` (mount the erofs there instead of `/usr`);
+2. apply the cfg / param / init patches **inside** `/mnt/rootfs`;
+3. `switch_root` into it, exactly as the reference does;
+4. keep the observer (Appendix AD) so the result is visible either way.
+
+Everything else - the token device, binder, hilog, the GPU and display modules, SELinux, the
+`ExecReboot` patch - is already done and stays valid; it is only the root/namespace strategy
+that changes.
