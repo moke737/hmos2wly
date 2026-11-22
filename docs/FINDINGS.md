@@ -3292,3 +3292,59 @@ Do not trust any prior diagnostic.  Begin with the smallest possible check:
 
 That is a one-hour exercise that should have been the first thing done, and it is now the only
 thing that matters.
+## Appendix AL - the bisect that finally localised the crash
+
+### AL.1 The method that worked
+
+Instead of reading logs (which were stale), each test changed exactly one thing and asked a
+question with a visible answer: **does the phone stay on?**
+
+| test | change | stays on? |
+|---|---|---|
+| tiny | init writes a line then sleeps - nothing else | **yes** |
+| test2 | + mount /proc /sys /tmp | **yes** |
+| test3 | full init, load_modules skipped, hand-over replaced by sleep | **yes** |
+| test4 | full init, load_modules KEPT, hand-over replaced by sleep | **yes** |
+| test5 | + switch_to_our_root's mkdir and binds (no root move) | **yes** |
+| test7 | + mount(R,"/",MS_MOVE) + chroot + exec | **no - reboots** |
+| test8 | same but with the ORIGINAL init (no patch) | **no** |
+| test9 | same but sleep instead of exec after move+chroot | **no** |
+
+### AL.2 The conclusion
+
+**The crash is `mount(R, "/", MS_MOVE)` / `chroot(".")` itself.**
+
+It is not the kernel modules, not the patched init, not PID 1 exiting, and not the exec.
+
+### AL.3 The likely cause and the fix
+
+The new root is built like this:
+
+```
+/mnt/rootfs/dev   <- MS_MOVE of /dev
+/mnt/rootfs/proc  <- MS_MOVE of /proc
+/mnt/rootfs/sys   <- MS_MOVE of /sys
+/mnt/rootfs/system<- MS_BIND of /usr/system
+...
+then: mount("/mnt/rootfs", "/", MS_MOVE)
+```
+
+Moving `/dev` into the new root and then moving the new root onto `/` produces a mount tree
+that contains itself, and the kernel does not survive it.
+
+**Fix to try next:** do not move the kernel filesystems in.  Create them fresh inside the new
+root instead:
+
+```
+mkdir /mnt/rootfs/{dev,proc,sys,tmp}
+mount tmpfs  /mnt/rootfs/dev
+mount proc   /mnt/rootfs/proc
+mount sysfs  /mnt/rootfs/sys
+mount tmpfs  /mnt/rootfs/tmp
+# only /data (and the vendor partitions) should be moved in, if at all
+mount("/mnt/rootfs", "/", MS_MOVE)
+chroot("."); exec /system/bin/init
+```
+
+That is the next single experiment, and with the bisect harness above it is a ten-minute
+round trip.
