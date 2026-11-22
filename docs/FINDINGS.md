@@ -2934,3 +2934,34 @@ start anything because a precondition is unmet.  Two cheap experiments:
 
 The observer from this appendix should be kept - it is the tool that makes all of this
 visible.
+## Appendix AE - the hilog ring is empty; init starts nothing
+
+Capturing `/dev/hilog` alongside `/dev/kmsg` shows the ring is **empty**:
+
+```
+--- hilog ---
+(no data)
+```
+
+while init's own log reader (pid 431) sits blocked in `hilog_read` - i.e. it is waiting for
+data that nobody writes.  `hilogd` is the writer, and `hilogd` is not running.  So the log
+reader is correct but idle; it is not a clue.
+
+The picture after the observer (Appendix AD):
+
+* HarmonyOS init runs both of its stages;
+* it starts its log reader, which blocks as designed;
+* **it starts no service at all** - no `samgr`, `foundation`, `appspawn`, `hilogd`,
+  `render_service`, `param_watcher`;
+* the live init sits in its normal event loop.
+
+So init is healthy and idle, and the reason it declines to start services is the thing to
+find next.  The two experiments proposed in Appendix AD stand:
+
+1. **single-service test**: replace the smallest cfg (`watchdog.cfg`) with one that defines a
+   3-line binary writing a file - if init starts it, the cfg format is fine and the problem is
+   the services themselves; if it does not, init is not reading the cfg directory we serve;
+2. **cfg directory check**: confirm inside the running system that `/system/etc/init` really is
+   our tmpfs (the observer can `listdir` it and record the result).
+
+With the observer in place both are cheap and give a definitive answer.
