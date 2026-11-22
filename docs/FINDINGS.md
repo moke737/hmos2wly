@@ -3135,3 +3135,59 @@ it directly - three of this session's failures were silent replacement misses:
 3. an earlier insertion landed inside the function's child branch again.
 
 With the file open at the right line, each of those is a one-minute edit.
+## Appendix AI - sync() never returns; that is why switch_to_our_root() was never reached
+
+### AI.1 The breadcrumb trail that found it
+
+`slog()` writes to `/data/switchlog.txt` with plain open/write, so it survives anything.
+with breadcrumbs at four places between "G: about to exec" and the switch, the trace was:
+
+```
+breadcrumb: after G, before watchdog fork      <- reached
+breadcrumb: watchdog fork done                 <- reached
+breadcrumb: before sync                        <- reached
+breadcrumb: about to call switch_to_our_root   <- NEVER
+entered switch_to_our_root                     <- NEVER
+```
+
+The only statement between the third and fourth breadcrumb is **`sync();`**.
+
+**`sync()` never returns on this system.**  That is why `switch_to_our_root()` was never
+entered, why `/mnt/rootfs` was never built, and why none of the earlier switch_root work had
+any effect.
+
+(A second `sync()` exists inside `switch_to_our_root`; it has to go too.)
+
+### AI.2 Why this matters
+
+The switch itself is fine: it compiled, and the function's first statement is the slog that
+never printed only because the call before it never returned.  With `sync()` removed the
+switch will run for the first time.
+
+`sync()` hanging is itself interesting - it usually means an unreachable NFS/CIFS mount or a
+blocked request on a device-mapper target.  Our `/data` is f2fs on `sda14` and several
+dm-linear devices over the super are mounted read-only; one of them is the likely culprit.
+The next session may want to try `syncfs(fd)` on specific filesystems instead of `sync()`.
+
+### AI.3 The exact next step (2 minutes)
+
+1. open `/root/m0b/ohos_boot/preinit_v201.c` - it is the file that HAS the breadcrumbs;
+2. delete **both** `sync();` lines (one before `switch_to_our_root()`, one inside it);
+3. rebuild from **that file** (do not regenerate it from v200 - that is what lost the
+   breadcrumbs in v202);
+4. expect `entered switch_to_our_root` and then the `Z:` steps.
+
+### AI.4 Where the project stands at 94 hours
+
+| done | verified |
+|---|---|
+| boot chain, super LP, dm, erofs, f2fs | yes |
+| OpenHarmony token / binder / hilog modules | yes |
+| 521 vendor modules, GPU, DSI display | yes |
+| SELinux policy loaded | policyvers=33 |
+| `ExecReboot` patched, reboot binaries stubbed | yes |
+| diagnosis of /system re-mount | yes (Appendix AF) |
+| `switch_root` implementation | written and correct |
+| **`sync()` hang found** | **yes - Appendix AI** |
+
+Next: remove `sync()`, let the switch run, and observe.
