@@ -3074,3 +3074,64 @@ The function itself is already written and compiles (`switch_to_our_root` in
 One function call stands between the project and a system whose `/system` really is the
 patched tree - after which the cfg and param overrides finally reach HarmonyOS init and the
 service layer can start.
+## Appendix AH - the recursion bug that invalidated earlier "successes"
+
+### AH.1 The bug
+
+When the observer was introduced (Appendix AD) the call `run_ohos_init_as_child();` was
+inserted by string replacement.  It landed **inside the child branch of the function itself**:
+
+```c
+if (pid == 0) {
+    setsid();
+    run_ohos_init_as_child();        /* <-- recursion */
+    execl("/system/bin/init", ...);  /* never reached */
+}
+```
+
+The child therefore called itself, the `g_watch_started` guard made it sleep forever, and
+**`execl` of HarmonyOS init never ran**.  Every "init" process seen in `/data/ohlog.txt` was
+one of our own forks.
+
+### AH.2 What that means for the record
+
+* v170-v195 "the device no longer reboots" was **not** HarmonyOS surviving - HarmonyOS init
+  was never started at all.  The system sat in our own sleep loop.
+* only from **v196 onwards** (recursion removed, `switch_root` called at the real hand-over
+  site) does HarmonyOS init actually run, and then the device reboots again at 34-37 s.
+
+So the honest baseline is: **HarmonyOS init runs and reboots the device**, and everything
+before v196 has to be re-evaluated.
+
+### AH.3 Where the work stands
+
+Working and verified:
+
+| component | evidence |
+|---|---|
+| boot chain, super, dm, erofs, f2fs | every boot |
+| OpenHarmony token / binder / hilog modules | `MOD: ... loaded ok` |
+| 521 vendor modules | loading |
+| Adreno GPU + DSI display probes | `kgsl-3d0 ... bound ... gmu` |
+| SELinux policy | `policyvers=33` |
+| `/system` bind + `switch_root` implementation | written, called at the hand-over |
+
+Open:
+
+* `switch_to_our_root()` writes no markers that survive - `state()` may not reach /data after
+  the switch and the post-switch `dump_kmsg_to()` never produced a file, so we do not yet know
+  which step it reaches;
+* HarmonyOS init still reboots (34-37 s) after the switch;
+* the reboot binaries are stubbed and `ExecReboot` is patched, so some other path is being
+  used.
+
+### AH.4 The right next step
+
+Stop using `str.replace()` to insert code.  Open the file, read the hand-over site, and edit
+it directly - three of this session's failures were silent replacement misses:
+
+1. the fork landed in the wrong branch (this appendix);
+2. `switch_to_our_root()` landed on the fallback exec instead of the real one;
+3. an earlier insertion landed inside the function's child branch again.
+
+With the file open at the right line, each of those is a one-minute edit.
