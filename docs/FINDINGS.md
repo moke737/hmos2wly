@@ -3237,3 +3237,58 @@ be re-checked once we know the device is really running the image we build.
 
 The one concrete, verified fact to build on: **the init we pack is correct, and the string it
 prints is missing at runtime.**
+## Appendix AK - THE REAL ROOT CAUSE: our init never runs at all
+
+### AK.1 The decisive experiment
+
+Every diagnostic in this project wrote its data into `/data`.  The files had been read
+repeatedly and every conclusion came from them.  So:
+
+1. delete `/data/init_state.txt`, `/data/kmsg_stock.txt`, `/data/switchlog.txt`, `/data/ohlog.txt`
+   from TWRP;
+2. flash the freshly built `boot_v205` and boot;
+3. check whether the files reappear.
+
+**They do not reappear.**
+
+```
+ls: /tmp/d/kmsg_stock.txt: No such file or directory
+ls: /tmp/d/init_state.txt: No such file or directory
+ls: /tmp/d/switchlog.txt: No such file or directory
+```
+
+### AK.2 What that means
+
+**Our `/init` has never executed.**  Not in v205, and by extension not in any of the builds
+whose data we have been reading.
+
+Everything those files contained - the checkpoints `A:` through `Z:`, the `hmos-preinit`
+lines, the `sync()` hang, the recursion trace, the `/system` mismatch - is **stale data from
+an older boot**, possibly days old.  The evidence that looked so compelling was being written
+by a build that ran once, long ago, and never again.
+
+### AK.3 What is actually verified
+
+| claim | status |
+|---|---|
+| the packed init contains the new strings | **verified** (3 ways: ramdisk dir, binary, re-extracted image) |
+| `fastboot flash boot_a` succeeds | verified |
+| `current-slot` is `a` | verified |
+| the kernel boots (OnePlus logo appears) | observed |
+| **our `/init` runs** | **FALSE** |
+
+### AK.4 The next step - start from zero
+
+Do not trust any prior diagnostic.  Begin with the smallest possible check:
+
+1. build a boot image whose `/init` is a **static binary that writes one line to /dev/kmsg**
+   and then sleeps forever - nothing else, no mounts, no modules;
+2. flash it and read `/dev/kmsg` through TWRP's own `dmesg` (the kernel ring survives until the
+   next reset);
+3. if the line appears, our init runs and the ramdisk is fine - then add back mounts bit by bit;
+4. if it does not appear, the bootloader/kernel is rejecting the ramdisk - check AVB, the
+   ramdisk format (cpio + lz4 legacy), and whether `boot.img` is even the partition being
+   booted.
+
+That is a one-hour exercise that should have been the first thing done, and it is now the only
+thing that matters.
