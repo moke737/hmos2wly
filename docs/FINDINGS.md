@@ -2635,3 +2635,58 @@ delivered by bind mounts.  The method is fully visible in the reference package;
 byte offsets are not transferable, because they must be derived from *our* binaries.
 
 That is the next phase, and it is a reverse-engineering task rather than a bring-up task.
+## Appendix Z - THE ROOT CAUSE: the hardware watchdog, not HarmonyOS
+
+### Z.1 The proof
+
+`/proc/cmdline` on the next boot carries the bootloader's record of the previous reset:
+
+```
+oplusboot.startupmode=hard_reset
+oplusboot.mode=normal
+```
+
+That is a **hardware reset**, not a software reboot.  HarmonyOS never asked for a reboot.
+
+The kernel log then explains why:
+
+```
+qcom_wdt_core: Unknown symbol msm_minidump_add_region (err -2)
+qcom_wdt_core: Unknown symbol qcom_scm_sec_wdog_deactivate (err -2)
+qcom_wdt_core: Unknown symbol oplus_show_utc_time (err -2)
+qcom_wdt_core: Unknown symbol oplus_get_cpu_ping_mask (err -2)
+qcom_wdt_core: Unknown symbol oplus_dump_cpu_online_smp_call (err -2)
+qcom_wdt_core: Unknown symbol oplus_dump_wdog_cpu (err -2)
+gh_virt_wdt:   Unknown symbol qcom_wdt_register / remove / pet_suspend / pet_resume
+```
+
+and `/proc/kallsyms` on the device confirms those symbols are **not present at all** (0 hits,
+not merely unexported), while `/sys/class/watchdog` is empty - i.e. **no watchdog driver is
+running on this kernel**.
+
+### Z.2 The chain
+
+1. The bootloader is unlocked (`verifiedbootstate=orange`), so it arms the PMIC watchdog
+   before starting Linux;
+2. the vendor's `qcom_wdt_core.ko` is the only thing that can pet or deactivate it, and it
+   cannot load on this pure-GKI kernel because the OPlus-specific symbols it needs are not
+   there;
+3. nothing pets the watchdog, so the PMIC resets the SoC about 30 seconds after power-on;
+4. that is the "34 second reset" this project has been chasing since day one.
+
+**Every fix applied so far - the OpenHarmony token device, its binder, hilog, the full stock
+module set, the Adreno GPU and the DSI display path - was correct but could never matter,
+because the machine was being reset by a hardware timer, not by HarmonyOS.**
+
+### Z.3 The fix
+
+Exactly what the reference port does: make the watchdog driver loadable again.
+
+The clean way is a **symbol shim module** that exports the missing functions as no-ops (the
+same trick that made `access_tokenid.ko` work).  `CONFIG_MODVERSIONS` means each symbol's
+CRC must match, so the prototypes have to be exact - they can be read from the kernel
+sources that ship these functions (`msm_minidump`, `qcom_scm`, the OPlus BSP patches).
+
+With `qcom_wdt_core.ko` loaded, its own kernel thread pets the PMIC watchdog and the hard
+reset disappears - at which point HarmonyOS finally gets more than 30 seconds to boot, and
+the real userspace work can begin.
