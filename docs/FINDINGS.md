@@ -3025,3 +3025,52 @@ mistake, and it is the one thing that has to change.
 Everything else - the token device, binder, hilog, the GPU and display modules, SELinux, the
 `ExecReboot` patch - is already done and stays valid; it is only the root/namespace strategy
 that changes.
+## Appendix AG - state at 91 hours, and the one thing left to do
+
+### AG.1 What was proven
+
+* the 36 s reboot was `ExecReboot()` in HarmonyOS init - patched to `ret`, the device now runs
+  indefinitely;
+* SELinux had never been mounted - now `policyvers=33`, `enforce=0`;
+* **HarmonyOS init re-mounts `/system` after the hand-over**, which is why every cfg / param
+  override placed under `/usr/system` is invisible to it (Appendix AF) - this is the single
+  explanation for "no service ever starts";
+* the observer (fork HarmonyOS init, stay PID 1) works and shows init healthy and idle with no
+  service processes.
+
+### AG.2 What was attempted and did not land
+
+`switch_to_our_root()` - build `/mnt/rootfs` with `/system` bound to the patched tree, then
+`switch_root` into it, exactly as the reference port does.  The function was written and the
+image built (`boot_v194_swroot.img`), but **the insertion never landed**: the string used to
+place the call did not match the file, so `Z:` lines never appear and the function is never
+entered.
+
+**This is a mechanical problem, not a design problem.**  The next session should not repeat
+the blind `str.replace()` approach; instead:
+
+1. open `preinit_v179.c` (or the newest) and find the actual hand-over line with an editor
+   (it is `execl("/system/bin/init", "/system/bin/init", NULL);` inside `main`);
+2. put `switch_to_our_root();` on the line **before** it;
+3. rebuild and check for `Z: root switched to /mnt/rootfs` in `/data/init_state.txt`.
+
+The function itself is already written and compiles (`switch_to_our_root` in
+`build_v194.sh`); it only needs to be called.
+
+### AG.3 Everything else is ready
+
+| component | state |
+|---|---|
+| boot chain, super, dm, erofs, f2fs | done |
+| OpenHarmony token / binder / hilog modules | done, loading |
+| 521 vendor modules | loading |
+| Adreno GPU + DSI display | probing, `/dev/dri` |
+| SELinux policy | loaded |
+| `ExecReboot` patch | done |
+| observer (PID 1 + fork) | done |
+| architecture diagnosis | **done, Appendix AF** |
+| `switch_root` implementation | **written, needs to be called** |
+
+One function call stands between the project and a system whose `/system` really is the
+patched tree - after which the cfg and param overrides finally reach HarmonyOS init and the
+service layer can start.
