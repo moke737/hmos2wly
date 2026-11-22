@@ -2754,3 +2754,72 @@ Next steps, in order of value:
    `start zzdiag` from a job, or register it as a `hdf_devhost` style helper);
 2. with the dump in hand, identify which service fails and why;
 3. then port the reference port's `stage_*_patch` approach to our own libraries.
+## Appendix AB - SELinux was never mounted (a root-cause find) and where the port stands
+
+### AB.1 The find
+
+The init now reports the SELinux state, and it showed:
+
+```
+S: cannot read /sys/fs/selinux/policyvers (No such file or directory)
+S: cannot read enforce (No such file or directory)
+S: /system/etc/selinux exists
+```
+
+**`/sys/fs/selinux` did not exist** - selinuxfs had never been mounted, so no policy was
+ever loaded, so every service's `setcon()` failed and **no service could start**.  It also
+means the `echo 0 > /sys/fs/selinux/enforce` used earlier in the project was failing
+silently all along.
+
+Mounting it fixes the situation:
+
+```
+S: selinuxfs mounted
+S: enforce now=0
+S: policyvers=33
+```
+
+With SELinux live the system behaves differently: the reboot returns (services finally
+start, load rises) and `/dev/dri` stays up.  This is a genuine step forward, not a
+regression.
+
+### AB.2 Also fixed along the way
+
+* `/system` is now a **real bind mount** of `/usr/system` instead of a symlink;
+* the patched init (Appendix AA) is still in force, so the reboot is only possible through
+  paths outside `ExecReboot` (kernel or another process).
+
+### AB.3 Where it stands
+
+Working and verified:
+
+| component | evidence |
+|---|---|
+| super mapping, erofs/f2fs mounts | checkpoint A, and every boot |
+| OpenHarmony token / binder / hilog modules | `MOD: ... loaded ok` |
+| Adreno GPU + DSI display | `/dev/dri`, `kgsl-3d0 ... bound ... gmu` |
+| 377 stock modules from vendor_dlkm | 264 load |
+| **SELinux policy** | `policyvers=33` |
+| **no reboot from init** | patched `ExecReboot` |
+
+Not working yet:
+
+* the complete first-stage set from vendor_boot fails wholesale
+  (`F: fstage_all loaded=0 failed=144`) - it is a cascade whose root is not visible;
+* HarmonyOS services still do not come up, so no boot animation and no display;
+* the injected diagnostic service (`zzdiag` in `hmos_init_cust_ext.cfg`) is installed but
+  never started, so we still cannot see inside init's own decisions.
+
+### AB.4 The three concrete leads for the next session
+
+1. **Find the root of the module cascade**: log the first ten failures with their errno from
+   `/data/fstage_all` in `modules.load` order - the first failure is the real one.
+2. **Make the injected service run**: `zzdiag` is in a config HarmonyOS definitely loads, yet
+   it never starts; try registering it as an `hdf_devhost` or against an existing service's
+   `on-restart` job, or append it to `init.sched.cfg` whose other jobs demonstrably run.
+3. **Feed the watchdog from the kernel once services are up**: with SELinux live the system
+   now does real work, which is when the PMIC watchdog starts to matter again.
+
+The project is past the point where it was blind and reset every 36 seconds.  It now runs,
+with a working GPU, display driver, SELinux policy and IPC stack; what remains is making
+HarmonyOS's own service layer come up.
