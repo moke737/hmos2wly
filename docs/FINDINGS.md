@@ -2875,3 +2875,62 @@ method for that (byte patches applied before boot, validated by sha256) is fully
 in Appendices S-T and its package.
 
 **The one thing to fix first next time is visibility**, not drivers.
+## Appendix AD - THE EYES: keeping PID 1 to observe HarmonyOS init
+
+### AD.1 The method
+
+The hand-over never had to be an `exec`.  Forking instead and staying PID 1 works:
+
+```
+V: forking HarmonyOS init as a child (we stay PID 1)
+V: child pid=437
+```
+
+The child `execl`s `/system/bin/init`; the parent keeps running as PID 1 and, because
+HarmonyOS init's `kill(-1)` deliberately spares PID 1, it survives and can observe.
+
+The fork is inserted before **every** `execl` of an init binary (there are six such call
+sites, one of which is the one that actually executes).  A `g_watch_started` guard makes sure
+only the first one takes effect; the parent then loops recording `/data/ohlog.txt`.
+
+### AD.2 What it recorded
+
+70 KB - 700 KB per boot of `/dev/kmsg` plus, for each init-related process, its `comm`,
+`cmdline`, `State`, `Uid`, `Threads`, `Wchan` and kernel `stack`.
+
+The first useful result:
+
+```
+----- pid 237 (init) -----   State: S  Wchan: hrtimer_nanosleep     <- normal event loop
+----- pid 431 (init) -----   State: S  Wchan: hilog_read            <- the log reader, blocked
+                             Stack: hilog_read+0x8c/0x2f0 [hilog] -> vfs_read -> read()
+----- pid 437 (init) -----   State: Z (zombie)                      <- first stage exited
+----- pid 438 (init) -----   State: S (sleeping)
+```
+
+Interpretation:
+
+* HarmonyOS init **is running** - two stages (the first becomes a zombie, the second lives);
+* it **has started its log reader**, which blocks in `hilog_read()` exactly as intended;
+* **no service process exists** - `samgr`, `foundation`, `appspawn`, `hilogd`, `render_service`
+  are simply not there;
+* the live init is asleep in its event loop, i.e. **it is not stuck, it has nothing to do**.
+
+So the failure is not a hang and not a crash: HarmonyOS init decides not to start its
+services.
+
+### AD.3 The immediate next question
+
+`init` reads its service list from `/system/etc/init/*.cfg` (we serve a tmpfs with 229
+originals plus our own).  Either it fails to parse them, or it parses them and refuses to
+start anything because a precondition is unmet.  Two cheap experiments:
+
+1. **parse feedback**: make init's own log readable - the log reader (pid 431) blocks in
+   `hilog_read`, so HarmonyOS's own hilog records *should* be accumulating in the kernel ring;
+   capture `/dev/hilog` instead of `/dev/kmsg` in the observer;
+2. **single-service test**: replace one tiny cfg (e.g. `watchdog.cfg`) with a version that
+   defines a service whose `path` is a 3-line binary that writes a file, and see whether init
+   starts it.  If it does, the cfg format is fine and the problem is the services themselves.
+
+The observer from this appendix should be kept - it is the tool that makes all of this
+visible.
