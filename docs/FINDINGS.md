@@ -3468,3 +3468,64 @@ Everything before this appendix now makes sense:
 * the "36 s reboot" was our own `/init` looping and eventually dying, not HarmonyOS.
 
 **The next session's first job is one `exec` fix**, and it is now a small, well-defined one.
+## Appendix AO - HARMONYOS INIT IS RUNNING (the loader was the last missing piece)
+
+### AO.1 The cause
+
+`execve("/system/bin/init")` was failing with **ENOENT** even though the file existed, was
+mode 755 and 456592 bytes.  The reason:
+
+```
+/system/bin/init            exists, executable
+/lib/ld-musl-aarch64.so.1   MISSING          <- the ELF interpreter
+/system/lib/ld-musl-aarch64.so.1             exists
+```
+
+HarmonyOS init is a dynamically linked musl binary whose interpreter is
+`/lib/ld-musl-aarch64.so.1`.  The new root had no `/lib`, so `execve` failed with ENOENT
+("no such file" - meaning the *interpreter*, not the binary).
+
+### AO.2 The fix
+
+Inside `switch_to_our_root`, before the root move, create the loader paths:
+
+```
+/lib/ld-musl-aarch64.so.1  -> /system/lib/ld-musl-aarch64.so.1
+/lib64/ld-linux-aarch64.so.1 -> /system/lib64/ld-linux-aarch64.so.1
+/lib/ld-linux-aarch64.so.1   -> /system/lib/ld-linux-aarch64.so.1
+```
+
+### AO.3 The proof
+
+```
+T18: loader link created        (x3)
+T15: root switched
+execfail.txt: DOES NOT EXIST   <- execl succeeded
+```
+
+and the process observer sees the same pid with two different command lines:
+
+```
+CMD 436 [/init ]                 <- our forked child
+CMD 436 [/system/bin/init ]      <- AFTER the successful exec
+```
+
+**HarmonyOS init is now genuinely executing** - for the first time in this project.
+
+### AO.4 What still does not happen
+
+No service appears: no `samgr`, `foundation`, `hilogd`, `appspawn`, `render_service`.  The
+observer still lists only `init` processes (eleven of them) plus kernel threads.
+
+But the conditions are finally right: `/system` is our patched tree (Appendix AM) and init is
+our binary (this appendix).  Whatever it decides now, it decides on our configuration.
+
+### AO.5 Where to look next
+
+1. capture `/proc/436/stack` and `/proc/436/wchan` - is init blocked, or looping?
+2. capture the contents of `/system/etc/init` **from inside the new root** to prove the cfgs
+   are the patched ones;
+3. capture `/dev/kmsg` after the switch only (the first reader drains it) and look for init's
+   parse errors;
+4. capture the exit status of every child init forks - a service that starts and dies
+   immediately would show up as a zombie.
