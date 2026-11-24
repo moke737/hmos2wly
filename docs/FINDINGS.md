@@ -3408,3 +3408,63 @@ Now that the observation works from *inside* the correct root, the next session 
 
 Everything needed to see HarmonyOS's decisions is now in place; only the question of why it
 starts no service remains.
+## Appendix AN - HarmonyOS init has never actually executed
+
+### AN.1 The evidence
+
+The observer (now running inside the correctly switched root) captured the command line of
+every process:
+
+```
+CMD 1    [/init ]
+CMD 239  [/init ]
+CMD 438  [/init ]
+CMD 440  [/init ]
+```
+
+**Every "init" process is ours.**  The `execl("/system/bin/init", ...)` fails, so the forked
+child falls back to its own `_exit(127)` and the parent keeps running `/init`.
+
+That explains everything observed so far:
+
+* no service ever starts - HarmonyOS init never runs;
+* the log reader blocked in `hilog_read` was one of our own forks;
+* all the process listings that looked like HarmonyOS stages were our own processes.
+
+### AN.2 Why the exec fails
+
+Candidates, in order:
+
+1. **`/system/bin/init` does not exist inside the new root.**  `/mnt/rootfs/system` is a bind
+   of `/usr/system`, so the path is `/usr/system/bin/init`; if that bind failed the exec has
+   nothing to run.
+2. **The patched-init bind replaced it with something not executable** - the `init_patched`
+   file is copied with mode 0755, but the bind onto `/mnt/rootfs/system/bin/init` may target a
+   path that does not exist yet at bind time.
+3. **The binary needs the musl loader** `/lib/ld-musl-aarch64.so.1`, which the new root may not
+   have (the OH tree keeps it at `/system/lib/ld-musl-aarch64.so.1`, not at `/lib`).
+
+### AN.3 The immediate check
+
+Have the observer, inside the new root, record:
+
+```
+access("/system/bin/init", R_OK|X_OK)     -> exists and executable?
+readlink /system/bin/init                  -> what is it?
+access("/lib/ld-musl-aarch64.so.1", R_OK)  -> does the loader exist?
+stat("/system/bin/init")                   -> size and mode
+```
+
+That single dump answers it.  The exec failure code should also be captured:
+`execl` sets errno, and the child can write it to `/data/execfail.txt` before `_exit`.
+
+### AN.4 Where this leaves the project
+
+Everything before this appendix now makes sense:
+
+* the switch_root work was necessary and is now correct (Appendix AM);
+* but HarmonyOS init has never run, so no service, no boot animation and no display could
+  ever appear;
+* the "36 s reboot" was our own `/init` looping and eventually dying, not HarmonyOS.
+
+**The next session's first job is one `exec` fix**, and it is now a small, well-defined one.
