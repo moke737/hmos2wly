@@ -3348,3 +3348,63 @@ chroot("."); exec /system/bin/init
 
 That is the next single experiment, and with the bisect harness above it is a ten-minute
 round trip.
+## Appendix AM - switch_root finally works (the architectural milestone)
+
+### AM.1 What was wrong
+
+Two separate bugs kept the root switch from ever happening:
+
+1. **`mount(R, "/", MS_MOVE)` needs the source to be a mountpoint.**  `/mnt/rootfs` was a
+   plain directory, so the move always failed with EINVAL.  Fix: bind `/mnt/rootfs` onto
+   itself first.
+2. **Moving `/dev`, `/proc`, `/sys` into the new root and then moving the root** created a
+   mount tree that contained itself.  Fix: create those filesystems **fresh** inside the new
+   root instead of moving them in.
+
+### AM.2 The proof
+
+With both fixes the switch log reads:
+
+```
+T15: entered
+T15: /system bound
+T15: MS_MOVE ok
+T15: root switched - returning for the observer
+```
+
+and the observer - which now runs **inside the new root** - writes `/data/ohlog2.txt`
+(315 KB) with a live process list.
+
+### AM.3 Why this matters
+
+Until now `/system` was re-mounted by HarmonyOS init after the hand-over, so every cfg, param
+and init override placed under `/usr/system` was invisible.  After `switch_root`, `/system`
+**is** the patched tree; HarmonyOS init can re-mount it as often as it likes and it will
+re-mount our tree every time.
+
+### AM.4 The state after the switch
+
+The observer inside the new root reports:
+
+```
+PS 1    init
+PS 240  init          <- HarmonyOS init (forked by our PID 1)
+PS 439-442 init       <- its own stage children
+PS 131  watchdogd     (kernel thread)
+PS 195  gh-watchdog   (kernel thread)
+```
+
+**No service process appears** - no `samgr`, `foundation`, `hilogd`, `appspawn`,
+`render_service`.  So HarmonyOS init runs, has our `/system`, and still starts nothing.
+
+### AM.5 The next question
+
+Now that the observation works from *inside* the correct root, the next session can:
+
+1. capture the `cmdline` of pids 240 and 439-442 - they name the stages that are running;
+2. capture `/system/etc/init` contents from inside the new root to confirm the cfgs are ours;
+3. capture `/dev/kmsg` **fresh** (the first capture drained it) by reading it only after the
+   switch, and look for init's own parse errors.
+
+Everything needed to see HarmonyOS's decisions is now in place; only the question of why it
+starts no service remains.
