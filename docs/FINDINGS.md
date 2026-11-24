@@ -3529,3 +3529,65 @@ our binary (this appendix).  Whatever it decides now, it decides on our configur
    parse errors;
 4. capture the exit status of every child init forks - a service that starts and dies
    immediately would show up as a zombie.
+## Appendix AP - execve HANGS in D state (the final blocker)
+
+### AP.1 The diagnosis
+
+With the loader link in place execfail.txt stopped appearing - which looked like success.
+The observer's dump proves otherwise:
+
+```
+=== child pid 442 ===
+--- comm ---
+init
+--- wchan ---
+0
+--- stack ---
+[<0>] __switch_to+0x174/0x2bc
+[<0>] __arm64_sys_execve+0x4c/0x64        <-- still inside execve
+--- stat ---
+442 (init) D 1 442 ...                    <-- state D, uninterruptible
+```
+
+execve does not fail - it hangs, in uninterruptible sleep.  The process never reaches
+HarmonyOS init's first instruction; it is stuck inside the syscall.
+
+The same dump confirms the good news: /system/etc/init IS our tmpfs (the patched cfgs are all
+listed), so the switch_root work is correct.
+
+### AP.2 Why this happens (most likely)
+
+Two suspects:
+
+1. the dm device deadlocks after MS_MOVE - the mount was moved while the device-mapper target
+   was still referenced, and the read queues behind a lock nobody will release;
+2. the erofs decompression needs a workqueue blocked by the environment change.
+
+A D state that never clears is the signature of a lock order problem, not missing data.
+
+### AP.3 What to try next
+
+1. do not move the root - chroot instead.  chroot("/mnt/rootfs") + chdir("/") changes the
+   process's root without touching mounts at all.  /system/bin/init then resolves inside the
+   patched tree and no mount is moved.  This avoids suspect 1 entirely.
+2. if chroot alone is not enough, mount the system erofs at /system directly in the final root
+   instead of binding it.
+3. capture /proc/<pid>/stack of the kworker threads at the same moment.
+
+chroot is a five-line change and is the natural next experiment.
+
+### AP.4 The state of the port at this point
+
+| done | evidence |
+|---|---|
+| boot chain, super, dm, erofs, f2fs | every boot |
+| OpenHarmony token / binder / hilog modules | loaded |
+| GPU + DSI display probes | /dev/dri |
+| SELinux policy | policyvers=33 |
+| switch_root mechanics | MS_MOVE ok |
+| /system is our patched tree | cfgs listed from inside |
+| musl loader path | /lib/ld-musl-aarch64.so.1 resolves |
+| HarmonyOS init executing | blocked in execve, state D |
+
+Only one syscall stands between the port and its first running HarmonyOS init - and the fix
+is to stop moving mounts and use chroot instead.
