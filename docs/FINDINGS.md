@@ -3649,3 +3649,58 @@ executing HarmonyOS init with our config directory start nothing?
 The next session should patch only the reboot *call sites* (not the constructors), and then
 attack the "init starts nothing" question with the observer that now works inside the correct
 root.
+## Appendix AR - init executes but does nothing: dm I/O is backed up
+
+### AR.1 The evidence
+
+At round 150 (150 seconds after the switch) the process list inside the new root is:
+
+```
+1    init        <- our PID 1
+236  init        <- HarmonyOS init, running
+237  kdmflush    <- device-mapper flush threads
+238  kdmflush
+239  kdmflush
+240  kdmflush
+```
+
+`kdmflush` is the device-mapper flush workqueue.  Four of them sitting there means dm I/O has
+been queued and is not draining.  HarmonyOS init is alive but every read of `/system` (the
+erofs over dm-linear) or `/data` queues behind that backlog, which would explain why it starts
+no service and never logs anything.
+
+The kernel ring is empty at every round because **our own kmsg relay child drains it** - that
+diagnostic has to be disabled before kmsg can be read from the observer.
+
+### AR.2 Why dm I/O might be stuck
+
+1. the `dm-linear` devices were created before RAMDISK was moved out of the way, and the
+   flush workqueue is waiting on a request that will never complete;
+2. `/data` was `MS_MOVE`d in an earlier test; in this build it is still a bind, but the dm
+   devices underneath `/system` were mapped by our own init very early;
+3. the super partition itself may be in a state where a flush never returns.
+
+### AR.3 What to try next
+
+1. **disable the kmsg relay** (the fork in main) so the observer can read `/dev/kmsg` - the
+   ring will show dm/erofs errors if there are any;
+2. **do not move or bind `/data`** at all in the first experiment - give HarmonyOS only
+   `/system`, and see whether it still stalls;
+3. capture `/proc/<kdmflush pid>/stack` - it names the request that is not completing.
+
+### AR.4 The state at 100+ hours
+
+| layer | state |
+|---|---|
+| boot chain, super, dm, erofs, f2fs | working |
+| token / binder / hilog modules | loaded |
+| GPU + DSI display probes | /dev/dri |
+| SELinux policy | policyvers=33 |
+| private root (chroot) | working |
+| /system = our patched tree | verified from inside |
+| musl loader | resolves |
+| HarmonyOS init executes | yes (original binary; our ret-patch broke it) |
+| services | none - dm flush backlog suspected |
+
+This is the closest the port has ever been: init runs in the right tree with the right loader,
+and the only remaining obstacle is I/O that does not drain.
