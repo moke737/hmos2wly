@@ -3591,3 +3591,61 @@ chroot is a five-line change and is the natural next experiment.
 
 Only one syscall stands between the port and its first running HarmonyOS init - and the fix
 is to stop moving mounts and use chroot instead.
+## Appendix AQ - execve works; our own init patch was what made it hang
+
+### AQ.1 The experiment that separated the two
+
+Same build, same switch, same loader link - the only change was **not** binding
+`init_patched` over `/system/bin/init`:
+
+| build | binary exec'd | result |
+|---|---|---|
+| test20 | our patched init | `stack: __arm64_sys_execve+0x4c/0x64`, state `D`, hangs |
+| test21 | the ORIGINAL init | `stack: lowpan_cleanup_module+0x8/0x8`, state normal, **exec completes** |
+
+**So `execve` is fine.  Our patch broke the binary.**
+
+### AQ.2 Why the patch breaks it
+
+The three patched functions were `ExecReboot`, `AddRebootCmdExecutor` and
+`InitAddRebootHook`, each rewritten to a single `ret`.
+
+`InitAddRebootHook` is very likely a **constructor** (`__attribute__((constructor))`): a
+function the dynamic loader calls while bringing the process up.  Returning immediately from a
+constructor that expects to run its full prologue/epilogue corrupts the startup path, and the
+process wedges inside `execve` - which is exactly the `D` state we observed.
+
+**Conclusion: never patch a constructor to `ret`.**  Either leave `InitAddRebootHook` alone or
+patch only the call sites of the reboot itself.
+
+### AQ.3 What this leaves
+
+With the original init:
+
+* `execve` completes;
+* the process runs;
+* `/system/etc/init` is our tmpfs (verified inside the new root);
+* the musl loader path is correct (`/lib/ld-musl-aarch64.so.1` resolves);
+* **and yet no service starts** - no `samgr`, `foundation`, `hilogd`, `appspawn`,
+  `render_service`.
+
+So the remaining question is unchanged and now cleanly isolated: why does a correctly
+executing HarmonyOS init with our config directory start nothing?
+
+### AQ.4 The state of the port
+
+| done | evidence |
+|---|---|
+| boot chain, super, dm, erofs, f2fs | every boot |
+| token / binder / hilog modules | loaded |
+| GPU + DSI display probes | /dev/dri |
+| SELinux policy | policyvers=33 |
+| private root (chroot) | T20: chroot ok |
+| /system = our patched tree | cfgs listed from inside |
+| musl loader reachable | access=0 |
+| **HarmonyOS init executes** | **yes, with the original binary** |
+| services | **none** |
+
+The next session should patch only the reboot *call sites* (not the constructors), and then
+attack the "init starts nothing" question with the observer that now works inside the correct
+root.
