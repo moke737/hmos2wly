@@ -4619,3 +4619,81 @@ GPU probe waiting on the same rail.
 | display | the DSI/panel stage away |
 
 The display driver now runs against the real controller.  What remains is the DSI/panel half.
+## Appendix BF - the complete display pipeline is up and the device nodes exist
+
+### BF.1 The pipeline
+
+```
+=== /sys/class/drm ===
+  card0
+  card0-DSI-1
+  card0-DP-1
+  card0-Virtual-1
+  renderD128
+  sde-crtc-0 .. sde-crtc-4
+
+=== platform driver bindings ===
+  msm_drm          bound: ae00000.qcom,mdss_mdp
+  drm_dsi_ctrl     bound: ae94000.qcom,mdss_dsi_ctrl0, ae96000.qcom,mdss_dsi_ctrl1
+  dsi_phy          bound: ae94400.qcom,mdss_dsi_phy0, ae96400.qcom,mdss_dsi_phy1
+  msm-dsi-display  bound: soc:qcom,dsi-display-primary, -secondary
+  kgsl-3d          bound: 3d00000.qcom,kgsl-3d0
+  msmdrm_smmu      bound: soc:qcom,smmu_sde_sec_cb, -unsec_cb
+```
+
+MDP, both DSI controllers, both DSI PHYs, both DSI displays, the GPU and the SDE SMMU are all
+bound to their hardware.  The display stack is fully operational in the kernel.
+
+### BF.2 devtmpfs did not make the nodes, so we did
+
+`/sys/class/drm/card0` exists but `/dev/dri/card0` did not, so the init reads the major:minor
+from sysfs and creates the node itself:
+
+```c
+mknod_from_sys("/sys/class/drm/card0/dev",      "/dev/dri/card0",      S_IFCHR|0666);
+mknod_from_sys("/sys/class/drm/renderD128/dev", "/dev/dri/renderD128", S_IFCHR|0666);
+mknod_from_sys("/sys/class/kgsl/kgsl-3d0/dev",  "/dev/kgsl-3d0",       S_IFCHR|0666);
+```
+
+Result:
+
+```
+/dev/dri/card0       rc=0 access=0
+/dev/dri/renderD128  rc=0 access=0
+/dev/kgsl-3d0        rc=0 access=0
+```
+
+**The GPU and display device nodes are now present in the private root.**
+
+### BF.3 render_service still segfaults
+
+```
+waitpid=517 status=0xb sig=11
+HiLogAdapter_init: Can't connect to server. Errno: 2
+HiLogBase: Can't connect to server. Errno: 2   (repeated)
+```
+
+Now that the device nodes exist, the remaining failure is the hilog server: `render_service`
+initialises its logging adapter first, cannot connect (`errno 2`, no `hilogd` socket in the
+private root), and dies before it opens the DRM device.
+
+`hilogd` is a HarmonyOS service started by init; it needs `/dev/unix/socket/hilog` and the
+`hilog` kernel module.  That is the next thing to bring up, and it is exactly the layer the
+port has already shown it can start (19 boot jobs, bootanimation running).
+
+### BF.4 The state at 116+ hours
+
+| layer | state |
+|---|---|
+| boot chain, filesystems, private root | working |
+| loader, devtmpfs, cgroups, SELinux | working |
+| HarmonyOS init as PID 1, 288 configs, 19 boot jobs | working |
+| vendor module chain | **24/24 loaded** |
+| msm_drm + DSI + PHY + GPU | **all bound to hardware** |
+| /sys/class/drm/card0 | **exists** |
+| /dev/dri/card0, renderD128, kgsl-3d0 | **created** |
+| render_service | SIGSEGV - needs the hilog server |
+| display | the hilog/samgr layer away |
+
+The display hardware is fully up.  What fails now is HarmonyOS's logging service, not the
+graphics stack.
