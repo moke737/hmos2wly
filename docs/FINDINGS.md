@@ -3704,3 +3704,70 @@ diagnostic has to be disabled before kmsg can be read from the observer.
 
 This is the closest the port has ever been: init runs in the right tree with the right loader,
 and the only remaining obstacle is I/O that does not drain.
+## Appendix AS - HarmonyOS init parses all 288 config files
+
+### AS.1 The missing piece was /etc
+
+The new root had no `/etc`, `/bin`, `/sbin`, `/usr`.  HarmonyOS expects them as symlinks into
+`/system`, so every config path failed:
+
+```
+[pid=1][Init][ERROR][init_config.c:56]Cfg error, /etc/init.usb.configfs.cfg not found
+```
+
+After creating the links:
+
+```
+T26: /etc /bin /sbin /usr linked into the new root
+```
+
+the very next boot reports:
+
+```
+[pid=1][Init][INFO][init.c:329]boot stage: parse config file finish. cfg count 288
+[pid=1][Init][INFO][init_service_socket.c:144]CreateSocket ueventd success
+[pid=1][Init][INFO][init_service_manager.c:1115]Service pin_auth_host already exists, updating.
+[pid=1][Init][INFO][init_service_manager.c:1115]Service fingerprint_auth_host already exists, updating.
+[pid=1][Init][INFO][init.c:197]Executing hook [50:0] cost [2]us, result 0.
+```
+
+**288 configuration files parsed.**  That is the first time HarmonyOS init has ever read our
+full config tree.
+
+### AS.2 Where it stops
+
+The last message is `Executing hook [50:0]`.  The next stage - the one that actually starts
+services - never appears, and no service process exists in `/proc`.
+
+### AS.3 The remaining errors, in order of importance
+
+```
+[ERROR][init_config.c:56]Cfg error, /vendor/modem/modem_vendor/init/init.modem.cfg not found
+[ERROR][init_cmds.c:97]Failed to get param ohos.boot.odm.conn.schiptype
+[ERROR][init_config.c:92]cannot get value for /vendor/etc/init/connectivity/init_start_connectivity_${...}_o
+[ERROR][init_service_manager.c:228]Args size is wrong permission, 0
+[ERROR][init_service_manager.c:228]Args size is wrong permission_acls, 0
+[PLUGIN][ERROR][selinux_static.c:33]No secon item in pin_auth_host
+[PLUGIN][ERROR][selinux_adp.c:115]restoreContentRecurse failed for '/dev/unix/socket/ueventd', err 2
+[ERROR][init_capability.c:126]service=hwsched_host not support caps = PERF_EVENT caps 41
+```
+
+`Args size is wrong permission` means the `permission`/`permission_acls` fields are empty in
+the cfgs - which is what the reference port patches.  `No secon item` means the SELinux context
+plugin has no mapping for these services.
+
+### AS.4 Where the port stands
+
+| layer | state |
+|---|---|
+| boot chain, super, dm, erofs, f2fs | working |
+| modules, GPU, DSI, SELinux policy | working |
+| private root (chroot) | working |
+| /system = our patched tree | verified |
+| musl loader, /dev, /etc /bin /sbin /usr | working |
+| HarmonyOS init executing | **yes** |
+| config parsing | **288 files** |
+| service start | **not yet** |
+
+The port is now failing in HarmonyOS's own service manager rather than in our boot chain - a
+completely different class of problem, and the first time that has been true.
