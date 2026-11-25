@@ -4571,3 +4571,51 @@ happened is the binding.
 
 The dependency-chain problem - which looked impossible two days ago - is completely solved.
 What remains is a device-tree / panel binding question.
+## Appendix BE - msm_drm binds to the MDP hardware
+
+### BE.1 The probe succeeded
+
+```
+/proc/device-tree                     access=0
+/sys/firmware/devicetree/base         access=0
+/sys/bus/platform/drivers/msm_drm     access=0
+/sys/class/drm                        access=0
+/sys/class/devfreq                    access=0
+
+=== /sys/bus/platform/drivers/msm_drm ===
+  uevent
+  ae00000.qcom,mdss_mdp       <-- the MDP device is BOUND to msm_drm
+  module
+```
+
+**`ae00000.qcom,mdss_mdp` in the driver directory means the platform driver probed and bound to
+the display controller.**  The driver is running against real hardware.
+
+### BE.2 What has not happened yet
+
+`/dev/dri/card0` does not exist and `/sys/class/drm` is not yet populated.  In msm_drm the DRM
+card is registered only after the whole pipeline is up: MDP (done), DSI controller, panel and
+the interconnect/regulator supplies.  `kgsl-3d0` is not registered either, consistent with the
+GPU probe waiting on the same rail.
+
+### BE.3 What to check next
+
+1. `/sys/bus/platform/drivers/` for msm_dsi, dsi_phy - are the DSI drivers bound?
+2. `/proc/device-tree/soc@0/*dsi*` - do the DSI nodes exist with a panel child?
+3. dmesg for msm_drm/dsi probe deferrals.
+
+### BE.4 State at 115+ hours
+
+| layer | state |
+|---|---|
+| boot chain, filesystems, private root | working |
+| loader, devtmpfs, cgroups, SELinux | working |
+| HarmonyOS init as PID 1, 288 configs, 19 boot jobs | working |
+| sandbox | bypassed |
+| vendor module chain | 24/24 loaded |
+| msm_drm probe | bound to ae00000.qcom,mdss_mdp |
+| DSI / panel | not yet registered |
+| /dev/dri/card0 | absent |
+| display | the DSI/panel stage away |
+
+The display driver now runs against the real controller.  What remains is the DSI/panel half.
