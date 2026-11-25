@@ -4209,3 +4209,83 @@ The GPU driver chain is the last missing piece.  Options:
 
 The port now fails for exactly one reason: the graphics drivers are not in the kernel.  Every
 layer above the driver is correct and demonstrable.
+## Appendix AZ - the GPU chain is broken at its base (ENOENT = missing dependencies)
+
+### AZ.1 What load_gpu_modules() reports
+
+Our init already calls `load_gpu_modules()`, which reads `/gpu/order.txt` and insmods each
+module in order.  The state file records every failure:
+
+```
+N: FAIL oplus_mm_kevent.ko        -> 17 (File exists)
+N: FAIL msm_kgsl.ko               -> 17 (File exists)      <- already loaded
+N: FAIL qseecom-mod.ko            -> 17 (File exists)
+N: FAIL dwc3-msm.ko               -> 2  (No such file or directory)
+N: FAIL ssusb-redriver-nb7vpq904m.ko -> 2  (No such file or directory)
+N: FAIL ucsi_glink.ko             -> 2  (No such file or directory)
+N: FAIL oplus_chg.ko              -> 2  (No such file or directory)
+N: FAIL oplus_chg_v2.ko           -> 2  (No such file or directory)
+N: FAIL oplus_chg_symbol.ko       -> 2  (No such file or directory)
+N: FAIL msm_drm.ko                -> 2  (No such file or directory)
+N: gpu modules loaded=3 failed=34
+N: kgsl=no drm=no fb0=no
+```
+
+### AZ.2 What errno 2 actually means here
+
+`finit_module` returning **ENOENT** when the file demonstrably exists in the ramdisk means the
+*module's own dependencies* are unresolved - the kernel cannot resolve a symbol, and reports it
+as "no such file" because the symbol's owner is absent.
+
+So `msm_drm.ko` cannot load because `dwc3-msm`, `oplus_chg`, `qseecom-mod` and friends cannot
+load, and those cannot load because the symbols they need are not in the GKI kernel.  This is
+the same 14-symbol problem recorded much earlier, now localised to the base of the chain.
+
+`msm_kgsl.ko` loading (errno 17 = already present) but still producing no `/dev/kgsl-3d0`
+means the GPU hardware itself is not being probed - consistent with the rest of the display
+stack being absent.
+
+### AZ.3 What this means for the port
+
+The port is complete above the driver layer:
+
+* boot chain, super, device-mapper, erofs, f2fs
+* private root with `/system` as our patched tree
+* musl loader, devtmpfs, /etc, /bin
+* cgroup controllers, SELinux policy
+* HarmonyOS init running **as PID 1**
+* 288 configs parsed, 19 boot jobs, services forked and exec'd
+* `bootanimation` running
+
+and it stops at exactly one place:
+
+**the vendor GPU modules cannot be loaded into the stock GKI kernel because the symbols they
+depend on are not exported by it.**
+
+### AZ.4 The remaining options
+
+1. **build the missing provider modules against the same GKI tree** with the exact vermagic
+   (`-o-g5012cb8f472f`) and CRC set, so the symbols exist;
+2. **use a kernel that exports them** - the vendor's own kernel from the device, at the cost of
+   giving up the "stock GKI + our ramdisk" arrangement that has worked so far;
+3. **check whether the display can be brought up without msm_drm** - unlikely, since
+   `render_service` needs `/dev/dri`.
+
+Option 1 is the only one consistent with everything built so far, and it is a kernel-module
+build task, not a boot task.
+
+### AZ.5 The state at 110+ hours
+
+| layer | state |
+|---|---|
+| boot chain / filesystems / private root | working |
+| loader / dev / cgroups / SELinux | working |
+| HarmonyOS init as PID 1 | running |
+| 288 configs / 19 boot jobs / services | working |
+| sandbox | bypassed |
+| **GPU module chain** | **broken: ENOENT on dependencies** |
+| GPU device nodes | absent |
+| render_service | SIGSEGV (consequence) |
+| display | not yet |
+
+Ten of eleven layers are proven working.  The eleventh is a kernel-module dependency problem.
