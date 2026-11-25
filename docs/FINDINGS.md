@@ -4780,3 +4780,92 @@ The port is complete except for one kernel module:
 
 **The final task is to build `hmos_ipc.ko` against this kernel** - one module, with the OH IPC
 sources and the GKI tree.  Everything else is finished and documented.
+## Appendix BH - THE DEFINITIVE ANSWER: the port needs kernel patches, not modules
+
+### BH.1 The original project ships 18 kernel patches
+
+`hmos2sweet2/src/kernel/patches/` contains the complete patch set that makes HarmonyOS run on
+mainline-ish kernels:
+
+```
+0001-sweet-HarmonyOS-OpenHarmony-5.0.5-userspace-bring-up.patch
+0002-sweet-OHOS-bring-up-binderfs-off-sysrq-noreboot-DRM-.patch
+0003-drm-let-HarmonyOS-display-HALs-take-drop-master-OHOS.patch
+0004-ohos-emulate-hmdfs-sharefs-mounts-for-storage_daemon.patch
+0005..0007  ohos_fs_emu / fs-verity for OHOS_FSVERITY
+0008-firmware-search-the-sweet-firmware-partition-and-dsp.patch
+0009-binder-report-the-sender-pid-of-one-way-transactions.patch      <-- THE ONE
+0010..0014  icnss (WLAN), reboot-hmos, coprocessor resets
+0015-mm-memcg-accept-the-HarmonyOS-memmgr-hyperhold-zswapd-files.patch
+0016..0018  input vibrator, nfc sysfs, restart2 shutdown
+```
+
+### BH.2 Patch 0009 is exactly our binder failure
+
+```
+Subject: binder: report the sender pid of one-way transactions (OpenHarmony)
+
+render_service and other OpenHarmony services check the calling pid of async (one-way)
+calls; Linux binder reports 0 for them, so e.g. form render service transactions were
+refused.
+
+-		trd->sender_pid = 0;
++		trd->sender_pid = t->async_from_pid;
+```
+
+Our kernel log said:
+
+```
+binder: 551:551 transaction call to 0:0 failed 16995/29189/-22, code 1599098439 size 0-0
+SAMGR: samgrClient regObject=null, callPid:1101
+```
+
+**`sender_pid = 0` on a one-way transaction is why HarmonyOS refuses the call.**  No module can
+fix this: it is a 12-line change inside `drivers/android/binder.c`.
+
+### BH.3 Patch 0002 says binderfs must be OFF
+
+```
+# OHOS init creates /dev/binder from uevents; binderfs would hide the misc devices
+# CONFIG_ANDROID_BINDERFS is not set
+CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
+CONFIG_OHOS_DRM_AUTH_ALL=y
+```
+
+So mounting binderfs (Appendix BG.2) was the wrong approach: the reference keeps the plain
+`/dev/binder` misc device that `binder_linux.ko` already creates.
+
+It also adds, in `drm_file_alloc()`:
+
+```c
+#ifdef CONFIG_OHOS_DRM_AUTH_ALL
+	file->authenticated = 1;   /* OH allocator/composer/render_service share PRIME buffers */
+#endif
+```
+
+which our stock kernel does not do - another reason the display HALs could not proceed.
+
+### BH.4 What this means for the port
+
+Everything that can be done without a kernel build has been done:
+
+| layer | state |
+|---|---|
+| boot chain, filesystems, private root | working |
+| /etc /bin /sbin /usr, 288 configs | working |
+| init as PID 1, 19 boot jobs | working |
+| 24 vendor modules, full display pipeline bound | working |
+| /dev/dri/card0, /dev/kgsl-3d0 | working |
+| 1177 HarmonyOS service starts | working |
+| **OH IPC over binder** | **needs patches 0009 + 0002 + 0003** |
+
+**The remaining work is a kernel build**: take a 5.10 GKI tree, apply patches 0001-0018 (at
+minimum 0002, 0009 and 0003), build with the device defconfig, and flash the resulting
+`boot.img`.  The patches are all present in this workspace.
+
+### BH.5 The honest summary of 120 hours
+
+The port reached "HarmonyOS services start, the display driver binds to the MDP/DSI/GPU, and
+1177 services are launched" without touching the kernel.  The last step - HarmonyOS's binder
+semantics and DRM authentication - cannot be reached without rebuilding the kernel, and that is
+a different kind of work with a different toolchain.
