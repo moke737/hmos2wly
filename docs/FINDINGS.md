@@ -4497,3 +4497,77 @@ the first sixteen.
 
 The module dependency problem is solved.  What is left is adding the panel drivers to the same
 ordered list.
+## Appendix BD - every module loads; only the DRM probe is left
+
+### BD.1 The final module state
+
+```
+pdr_interface.ko        rc=0   OK
+pmic_glink.ko           rc=0   OK
+altmode-glink.ko        rc=0   OK
+ucsi_glink.ko           rc=0   OK
+tcpc_class.ko           rc=17  already
+ssusb-redriver-...      rc=0   OK
+dwc3-msm.ko             rc=0   OK
+oplus_chg.ko            rc=0   OK
+oplus_chg_v2.ko         rc=0   OK
+oplus_chg_symbol.ko     rc=0   OK
+fsa4480-i2c.ko          rc=0   OK
+i2c-msm-geni.ko         rc=17  already
+rt-regmap.ko            rc=17  already
+mdt_loader.ko           rc=17  already
+msm_performance.ko      rc=17  already
+msm_ext_display.ko      rc=17  already
+panel_event_notifier.ko rc=17  already
+oplus_theia.ko          rc=17  already
+olc.ko                  rc=17  already
+oplus_mm_kevent.ko      rc=17  already
+oplus_mm_kevent_fb.ko   rc=17  already
+msm_drm.ko              rc=0   OK     <-- the display driver
+msm-mmrm.ko             rc=17  already
+msm_kgsl.ko             rc=17  already
+```
+
+**All 24 modules the graphics stack needs are loaded.**  The dependency problem documented in
+Appendix BC is fully solved.
+
+### BD.2 But /dev/dri still does not exist
+
+```
+/dev/dri/card0        access=-1
+/dev/kgsl-3d0         access=-1
+/dev/dma_heap         access=-1
+```
+
+A module loading is not the same as its probe binding.  `msm_drm` is in the kernel, but the DRM
+device is only created when `msm_drm`'s platform driver probes a matching device tree node -
+which needs the DSI panel, the display clocks and the interconnect paths described in the DTB
+the kernel was booted with.
+
+The panel-side modules report "already loaded" (errno 17), so they are present; what has not
+happened is the binding.
+
+### BD.3 What to look at next
+
+1. **`/proc/device-tree`** inside the private root - does it contain the `mdss` / `dsi` /
+   `qcom,mdss_dsi` nodes at all?  If the DTB has no display nodes, no probe can happen.
+2. **`dmesg` for `msm_drm`'s probe** - a failed probe prints its reason (`-EPROBE_DEFER`,
+   missing supply, missing panel).
+3. **the panel driver** - OnePlus panels are often bound through `oplus_theia` / `olc`; if the
+   panel node names a compatible that no loaded driver matches, the probe defers forever.
+
+### BD.4 The state at 114+ hours
+
+| layer | state |
+|---|---|
+| boot chain, filesystems, private root | working |
+| loader, devtmpfs, cgroups, SELinux | working |
+| HarmonyOS init as PID 1, 288 configs, 19 boot jobs | working |
+| sandbox | bypassed |
+| **vendor module chain** | **24/24 loaded, msm_drm included** |
+| DRM probe | **does not bind** |
+| /dev/dri, /dev/kgsl-3d0 | absent |
+| display | one probe away |
+
+The dependency-chain problem - which looked impossible two days ago - is completely solved.
+What remains is a device-tree / panel binding question.
