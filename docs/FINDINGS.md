@@ -3771,3 +3771,70 @@ plugin has no mapping for these services.
 
 The port is now failing in HarmonyOS's own service manager rather than in our boot chain - a
 completely different class of problem, and the first time that has been true.
+## Appendix AT - init parses 288 cfgs, registers services, then exits 0
+
+### AT.1 The exit status
+
+Reaping the child finally gave the answer:
+
+```
+init exited normally, code=0
+```
+
+HarmonyOS init is not crashing and not being killed.  It parses all 288 config files,
+registers its services, creates the ueventd socket, and then **returns from main**.
+
+### AT.2 The last messages
+
+```
+[INFO][init_service_socket.c:144]CreateSocket ueventd success
+[INFO][init_service_manager.c:1115]Service pin_auth_host already exists, updating.
+[INFO][init_service_manager.c:1115]Service fingerprint_auth_host already exists, updating.
+[INFO][init.c:329]boot stage: parse config file finish. cfg count 288
+[PLUGIN][INFO][seccomp_policy_static.c:48]seccomp enabled.
+[INFO][init.c:197]Executing hook [50:0] cost [2]us, result 0.
+```
+
+The next boot stage - the one that starts services - never runs.
+
+### AT.3 --second-stage did not change anything
+
+Passing `--second-stage` on the exec produced an identical log and the same exit 0.  So the
+argument is not what selects the service-start path in this build.
+
+### AT.4 The most likely cause: missing params
+
+```
+[ERROR][init_cmds.c:97]Failed to get param ohos.boot.odm.conn.schiptype
+[ERROR][init_config.c:92]cannot get value for
+        /vendor/etc/init/connectivity/init_start_connectivity_${ohos.boot.odm.conn.schiptype}_o
+[ERROR][init_config.c:56]Cfg error, /vendor/modem/modem_vendor/init/init.modem.cfg not found
+```
+
+Every `ohos.boot.*` parameter is missing, and `/vendor/modem/.../init.modem.cfg` cannot be
+found.  Those params come from the vendor partition's parameter files; if init cannot read
+them it may well take the degraded path that ends after parsing.
+
+### AT.5 Next steps
+
+1. **check what /vendor actually contains inside the new root** - is `/vendor/etc/param`
+   populated, and is `/vendor/modem/...` present at all?
+2. **set the `ohos.boot.*` params** before the switch (the reference port does this);
+3. if the params are not the cause, disassemble init around the `boot stage: init` string to
+   see what gates it.
+
+### AT.6 Where the port stands
+
+| layer | state |
+|---|---|
+| boot chain, super, dm, erofs, f2fs | working |
+| modules, GPU, DSI, SELinux policy | working |
+| private root, /system = our tree | working |
+| musl loader, /dev, /etc /bin /sbin /usr | working |
+| HarmonyOS init executing | yes |
+| config parsing | **288 files** |
+| service registration | **yes** |
+| service start | **init exits 0 before that stage** |
+| display | no |
+
+The port now fails entirely inside HarmonyOS's own logic, with every layer beneath it working.
