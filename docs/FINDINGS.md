@@ -3998,3 +3998,70 @@ may be what kills it.
 | display | not yet |
 
 The port has reached the graphics service.  Everything below it works.
+## Appendix AW - the sandbox is what remains
+
+### AW.1 The last error
+
+Every service reports the same thing:
+
+```
+[pid=4522][BEGET][ERROR][sandbox.c:636]Sandbox system has not been created.
+[pid=1][WARNING][init_common_service.c:418]Service warning -1 netmanager, failed to enter sandbox.
+[pid=1][WARNING][init_signal_handler.c:43]Child process render_service(pid 3334) exit with signal : 11
+```
+
+**The beget sandbox has never been created**, so every service that asks to enter one fails,
+and at least `render_service` then segfaults.
+
+### AW.2 What the sandbox needs
+
+`/system/etc/sandbox/system-sandbox.json`:
+
+```json
+{
+    "sandbox-root" : "/mnt/sandbox/system",
+    "mount-bind-paths" : [
+        { "src-path": "/system/bin",   "sandbox-path": "/system/bin",   "sandbox-flags": ["bind","rec","private"] },
+        { "src-path": "/system/etc",   "sandbox-path": "/system/etc",   "sandbox-flags": ["bind","rec","private"] },
+        { "src-path": "/system/lib64", "sandbox-path": "/system/lib64", "sandbox-flags": ["bind","rec","private"] },
+        { "src-path": "/system/lib",   "sandbox-path": "/system/lib",   "sandbox-flags": ["bind","rec","private"] },
+        ...
+    ]
+}
+```
+
+The sandbox is built under `/mnt/sandbox/system` by `beget`, which needs its own mount
+namespace and its own device/socket - `/dev/beget`.  Our private root never creates
+`/mnt/sandbox`, and `beget` reports that the sandbox does not exist.
+
+### AW.3 What to try next
+
+1. create `/mnt/sandbox` in the new root before the switch;
+2. check whether `/dev/beget` (a device or socket) is required - `beget` is the service that
+   builds the sandbox and it is started by init's own boot jobs;
+3. alternatively, set `"sandbox": 0` in the affected cfgs so services run without one - that
+   is very likely how the reference port gets graphics up, because the sandbox is a security
+   feature, not a functional requirement.
+
+**Option 3 is the cheap and probably decisive one**: with `"sandbox": 0` the services would
+exec directly and `render_service` would no longer be killed by the beget failure.
+
+### AW.4 The state of the port at the end of this session
+
+| layer | state |
+|---|---|
+| boot chain, super, dm, erofs, f2fs | working |
+| modules, GPU, DSI, SELinux policy | working |
+| private root, /system = our tree | working |
+| loader, /dev (devtmpfs), /etc /bin | working |
+| cgroup controllers | mounted early (T34) |
+| HarmonyOS init as PID 1 | **running** |
+| config parsing | **288 files** |
+| boot jobs | **19 finish** |
+| services forked and exec'd | **yes** |
+| sandbox | **not created - all services fail to enter it** |
+| render_service | **SIGSEGV, consequence of the sandbox failure** |
+| display | not yet |
+
+Everything in the boot chain, the filesystem layout, the loader, the cgroups and init itself
+now works.  The single remaining blocker is HarmonyOS's sandbox (beget).
