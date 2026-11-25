@@ -3838,3 +3838,87 @@ them it may well take the degraded path that ends after parsing.
 | display | no |
 
 The port now fails entirely inside HarmonyOS's own logic, with every layer beneath it working.
+## Appendix AU - HARMONYOS INIT IS STARTING SERVICES (the PID 1 gate)
+
+### AU.1 The gate, found by disassembling init
+
+The binary contains exactly this sequence:
+
+```asm
+35608:  bl   signal@plt          ; signal(SIGPIPE, SIG_IGN)
+3560c:  cmp  w20, #2             ; argc >= 2 ?
+35610:  b.lt 35628
+35614:  ldr  x0, [x19, #8]       ; argv[1]
+3561c:  adr  x1, c401            ; "--second-stage"
+35620:  bl   strcmp@plt
+35624:  cbz  w0, 356c8
+35628:  mov  x0, xzr
+3562c:  bl   GetUptimeInMicroSeconds
+
+3563c:  bl   getpid@plt
+35640:  cmp  w0, #1              ; <-- getpid() == 1 ?
+35644:  b.ne 3565c              ; <-- if NOT pid 1: log and return 0
+35648:  bl   60330               ; <-- the real init path
+```
+
+**HarmonyOS init refuses to run unless it is PID 1.**  When we forked it (pid 439,
+439...), `getpid()` returned 439, so init logged one line and returned 0 - which is exactly
+the `init exited normally, code=0` observed in Appendix AT.
+
+Note that `--second-stage` does not bypass this: the `cbz w0, 356c8` branch only changes the
+argv it later reads; the `getpid()` check is on both paths.
+
+### AU.2 The fix
+
+Do not fork init.  `exec` it directly, so our PID 1 becomes HarmonyOS init:
+
+```c
+slog("T32: exec'ing HarmonyOS init as PID 1");
+execl("/system/bin/init", "/system/bin/init", NULL);
+```
+
+The cost is that we lose the in-root observer (it was the fork's parent), but the observer had
+served its purpose.
+
+### AU.3 The result
+
+`/data/exit_status.txt` no longer appears - init does not exit.  And the kernel log now shows:
+
+```
+[pid=1][Init][INFO][init.c:149]boot job boot-service:service-2-009 start.
+[pid=1][Init][INFO][init.c:154]boot job boot-service:service-2-009 finish diff 952 us.
+[pid=1][Init][INFO][init.c:149]boot job boot-service:service-2-010 start.
+[pid=1][Init][INFO][init.c:154]boot job boot-service:service-2-010 finish diff 1000 us.
+...
+[pid=1][Info][init_service_manager.c:1210]Service device_usage_stats_service start failed!
+[pid=1][INFO][init_common_service.c:859]ServiceReap start failed! will reStart -N second later
+```
+
+**HarmonyOS init is running its boot jobs and starting services.**  The log spans more than
+500 seconds of uptime.
+
+### AU.4 What still fails
+
+* `device_usage_stats_service` reports "start failed" fifteen times;
+* services are started and immediately reaped (`ServiceReap start failed! will reStart -N`);
+* the `-N` delay is a negative number, so those services will never be retried;
+* no boot animation appears.
+
+Those are ordinary service-level problems now - the kind the reference port solves by patching
+individual binaries and config entries - not boot-chain problems.
+
+### AU.5 The state of the port after this
+
+| layer | state |
+|---|---|
+| boot chain, super, dm, erofs, f2fs | working |
+| modules, GPU, DSI, SELinux policy | working |
+| private root, /system = our tree | working |
+| musl loader, /dev, /etc /bin /sbin /usr | working |
+| HarmonyOS init as PID 1 | **running** |
+| config parsing | **288 files** |
+| boot jobs | **executing** |
+| service start | **attempted, some succeed, some fail** |
+| display | not yet |
+
+**This is the first time in the project that HarmonyOS's own service manager is doing work.**
