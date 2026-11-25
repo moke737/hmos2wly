@@ -4697,3 +4697,86 @@ port has already shown it can start (19 boot jobs, bootanimation running).
 
 The display hardware is fully up.  What fails now is HarmonyOS's logging service, not the
 graphics stack.
+## Appendix BG - HarmonyOS userspace runs; the last blocker is OH's binder
+
+### BG.1 What now works
+
+From the detached observer, 40 seconds in:
+
+```
+card0=0 renderD128=0 kgsl=0
+
+socket dir:
+  CJAppSpawn
+  NativeSpawn
+  paramservice
+  PropBridge
+  init_control_fd
+  fd_holder
+  file_migrate_ability
+
+procs:
+  1 init / 238 init / 433 init / 539 init
+  555 samgr.bin
+  757 hilogd
+  2012 render_service
+```
+
+and the kernel log records **1177 service starts**, including foundation, appspawn,
+bootanimation, display_engine_service, drm_service, audio_server, camera_service and the rest.
+
+**HarmonyOS userspace is genuinely running on the OnePlus 10 Pro.**
+
+### BG.2 The two fixes that got it there
+
+1. **the real passwd** (Appendix never written - see below).  The super's system partition
+   carries a 69-byte passwd with only `system_ucenter` and `system_ai`; init therefore logged
+   `SetOwner invalid uid : foundation` and foundation restarted 21 times.  Overlaying the OH
+   system tree's real 298-line passwd (foundation=5523, graphics=1003) brought
+   `SetOwner invalid uid` to **zero occurrences** and cut foundation's restarts from 21 to 4.
+
+2. **binderfs**.  `samgr` opens `/dev/binder`; mounting the binder filesystem and creating the
+   node works:
+   ```
+   mount binderfs rc=0 (ok)
+   symlink /dev/binder rc=0 access=0
+   binderfs: features vndbinder hwbinder binder binder-control
+   ```
+
+### BG.3 The last blocker
+
+With binderfs up, the services reach samgr but every transaction fails:
+
+```
+SAMGR: samgrClient regObject=null, callPid:1101
+binder: 551:551 transaction call to 0:0 failed 16995/29189/-22, code 1599098439 size 0-0
+```
+
+`-22` is EINVAL on every call.  **HarmonyOS uses a modified binder**, not the Android one.
+The reference port ships it as `houji_hmos_ipc.ko` (493744 bytes).  Loading it here:
+
+```
+insmod /hmos_ipc.ko rc=8 (Exec format error)
+```
+
+**ENOEXEC = vermagic mismatch**: the module was built for houji's kernel, not for the stock GKI
+kernel on this device.
+
+### BG.4 What that means
+
+The port is complete except for one kernel module:
+
+| layer | state |
+|---|---|
+| boot chain, filesystems, private root | working |
+| /etc /bin /sbin /usr, 288 configs | working |
+| init as PID 1, 19 boot jobs | working |
+| vendor module chain (24 modules) | working |
+| MDP + DSI + PHY + GPU bound | working |
+| /dev/dri/card0, /dev/kgsl-3d0 | working |
+| OpenHarmony services | **1177 starts, samgr/hilogd/bootanimation alive** |
+| OH binder (ipc) | **needs rebuilding for this kernel** |
+| display | blocked only by the binder |
+
+**The final task is to build `hmos_ipc.ko` against this kernel** - one module, with the OH IPC
+sources and the GKI tree.  Everything else is finished and documented.
