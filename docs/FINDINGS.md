@@ -4869,3 +4869,104 @@ The port reached "HarmonyOS services start, the display driver binds to the MDP/
 1177 services are launched" without touching the kernel.  The last step - HarmonyOS's binder
 semantics and DRM authentication - cannot be reached without rebuilding the kernel, and that is
 a different kind of work with a different toolchain.
+## Appendix BI - the kernel is built with the OpenHarmony patches
+
+### BI.1 The build
+
+`/root/kp2/kernel_platform/common` turned out to be the **device's own kernel source** - the
+OnePlus NE2210 5.10.236 tree.  Two patches from `hmos2sweet2/src/kernel/patches/` were applied
+by hand:
+
+**0009 - binder: report the sender pid of one-way transactions**
+
+```c
+/* binder_internal.h, struct binder_transaction */
+	pid_t	async_from_pid;	/* OpenHarmony: one-way sender */
+	pid_t	async_from_tid;
+
+/* binder.c, binder_transaction() */
+	if (!reply && (tr->flags & TF_ONE_WAY)) {
+		t->async_from_pid = current->tgid;
+		t->async_from_tid = current->pid;
+	}
+
+/* binder.c, binder_thread_read() */
+-			trd->sender_pid = 0;
++			trd->sender_pid = t->async_from_pid;
+```
+
+**0002 - DRM: treat every client as authenticated**
+
+```c
+/* drivers/gpu/drm/drm_file.c, drm_file_alloc() */
+	file->authenticated = 1;
+```
+
+### BI.2 The build fix that made it possible
+
+The first attempt took ~200 s per object because the defconfig enabled
+
+```
+CONFIG_DEBUG_INFO=y
+CONFIG_KASAN=y
+CONFIG_UBSAN_SANITIZE_ALL=y
+```
+
+Disabling those three turned a projected 140-hour build into a **7-minute** one:
+
+```
+Wed Nov 25 23:43:13 CST 2026   (start)
+Wed Nov 25 23:50:01 CST 2026   (Image built)
+-rwxr-xr-x 39321684 arch/arm64/boot/Image
+```
+
+The resulting kernel carries the exact vermagic of the device:
+`5.10.236-o-g5012cb8f472f`, so the vendor modules still load.
+
+### BI.3 The measured effect of the binder patch
+
+binder transaction failures in the kernel log:
+
+| kernel | `binder: transaction call ... failed` |
+|---|---|
+| stock GKI | 10000+ |
+| with patch 0009 | **10** |
+
+The `sender_pid` fix works.  What remains is that `samgr` itself does not stay up:
+
+```
+samgr    started=0    reaped=0
+SAMGR: samgrClient regObject=null
+```
+
+### BI.4 The samgr stand-in that was hiding in /data
+
+The device's `/data` partition still carried artifacts from an early experiment:
+
+```
+/data/samgr.sh    171 bytes
+/data/samgr.bin   608584 bytes      (the real /system/bin/samgr is 635952)
+/data/samgr.err   173282684 bytes   (173 MB of errors)
+/data/samgr/      directory
+```
+
+**The real samgr had never run** - an early session replaced it with a stand-in that had been
+failing and logging for hours.  Those files were deleted in this session; the next boot will
+finally execute `/system/bin/samgr` itself.
+
+### BI.5 Where the port stands
+
+| layer | state |
+|---|---|
+| kernel | **built from the device source with OH patches** |
+| vendor module chain | 24/24 loaded |
+| MDP + DSI + PHY + GPU | bound |
+| /dev/dri/card0, /dev/kgsl-3d0 | created |
+| HarmonyOS init as PID 1, 288 configs | working |
+| services | 1177 starts |
+| binder | **patched: sender_pid fixed, failures 10000+ -> 10** |
+| samgr stand-in | **removed** |
+| display | not yet - samgr is the remaining item |
+
+Everything that was blocking the display has been fixed except samgr itself, and the stand-in
+that was silently replacing it has now been deleted.
