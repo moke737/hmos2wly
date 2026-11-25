@@ -4407,3 +4407,93 @@ load, so no `/dev/dri` is created, so `render_service` segfaults.
 | everything above it (msm_drm, /dev/dri, render_service, display) | blocked by that one module |
 
 The project is now blocked on a single loadable module, not on architecture.
+## Appendix BC - the whole vendor module chain loads, including msm_drm
+
+### BC.1 The dependency order, solved
+
+Six iterations of symbol diffing against a live `/proc/kallsyms` produced the exact order:
+
+```
+pdr_interface.ko          -
+pmic_glink.ko             needs pdr_*                    (pdr_interface)
+altmode-glink.ko          needs pmic_glink_*             (pmic_glink)
+ucsi_glink.ko             -
+tcpc_class.ko             already loaded
+ssusb-redriver-nb7vpq904m.ko  provides redriver_*
+dwc3-msm.ko               needs redriver_*              (ssusb-redriver)
+oplus_chg.ko              needs oplus_dwc3_config_usbphy_pfunc (dwc3-msm)
+oplus_chg_v2.ko           -
+oplus_chg_symbol.ko       needs register_chg_glink_notifier_v1/_v2 (oplus_chg)
+fsa4480-i2c.ko            needs register_chg_glink_notifier (oplus_chg_symbol)
+i2c-msm-geni.ko           already loaded
+rt-regmap.ko              already loaded
+msm_drm.ko                needs altmode_*, dwc3_msm_*, fsa4480_*
+msm-mmrm.ko               already loaded
+msm_kgsl.ko               already loaded
+```
+
+The two keys were:
+
+* `oplus_chg_symbol.ko` exports the **unsuffixed** `register_chg_glink_notifier` that
+  `fsa4480-i2c` needs, while `oplus_chg.ko` exports only the `_v1`/`_v2` variants - so
+  `oplus_chg_symbol` must load between them;
+* `ssusb-redriver` must precede `dwc3-msm` must precede `oplus_chg`, or each one's symbols are
+  missing when it is needed.
+
+### BC.2 The result
+
+```
+pdr_interface.ko       rc=0   OK
+pmic_glink.ko          rc=0   OK
+altmode-glink.ko       rc=0   OK
+ucsi_glink.ko          rc=0   OK
+tcpc_class.ko          rc=17  already
+ssusb-redriver-...     rc=0   OK
+dwc3-msm.ko            rc=0   OK
+oplus_chg.ko           rc=0   OK
+oplus_chg_v2.ko        rc=0   OK
+oplus_chg_symbol.ko    rc=0   OK
+fsa4480-i2c.ko         rc=0   OK
+i2c-msm-geni.ko        rc=17  already
+rt-regmap.ko           rc=17  already
+msm_drm.ko             rc=0   OK        <-- the display driver
+msm-mmrm.ko            rc=17  already
+msm_kgsl.ko            rc=17  already
+```
+
+**Every vendor module the graphics stack needs now loads.**  `msm_drm` is in the kernel.
+
+### BC.3 What remains
+
+`/dev/dri/card0` still does not appear: `msm_drm` loads but its probe does not bind, because
+the panel and extended-display drivers from `order.txt` are not loaded yet:
+
+```
+msm_ext_display.ko
+panel_event_notifier.ko
+oplus_theia.ko
+olc.ko
+oplus_mm_kevent.ko / oplus_mm_kevent_fb.ko
+msm_performance.ko
+fsa4480-i2c.ko (done)
+mdt_loader.ko
+pdr_interface.ko (done)
+```
+
+Adding those to the chain is the next step, and it is the same mechanical process that solved
+the first sixteen.
+
+### BC.4 The state at 114+ hours
+
+| layer | state |
+|---|---|
+| boot chain, filesystems, private root | working |
+| loader, devtmpfs, cgroups, SELinux | working |
+| HarmonyOS init as PID 1, 288 configs, 19 boot jobs | working |
+| sandbox | bypassed |
+| **vendor module chain** | **16/16 load, msm_drm included** |
+| DRM probe / /dev/dri | needs the panel drivers |
+| display | one step away |
+
+The module dependency problem is solved.  What is left is adding the panel drivers to the same
+ordered list.
