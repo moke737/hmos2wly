@@ -4065,3 +4065,70 @@ exec directly and `render_service` would no longer be killed by the beget failur
 
 Everything in the boot chain, the filesystem layout, the loader, the cgroups and init itself
 now works.  The single remaining blocker is HarmonyOS's sandbox (beget).
+## Appendix AX - sandbox:0 works; bootanimation now runs
+
+### AX.1 The change
+
+`graphic.cfg` (bound over `/system/etc/init/graphic.cfg` by our init) had no `sandbox` key,
+so HarmonyOS used its default (enabled).  Since the beget sandbox never gets created in a
+private root, every service failed to enter it.
+
+Adding `"sandbox" : 0` to the two services in that file:
+
+```json
+"name" : "render_service",
+"path" : ["/system/bin/render_service"],
+"sandbox" : 0,
+
+"name" : "bootanimation",
+"path" : ["/system/bin/bootanimation"],
+"sandbox" : 0,
+```
+
+### AX.2 The result
+
+`bootanimation` now starts cleanly:
+
+```
+[pid=1][INFO][init_common_service.c:676]ServiceStart started info bootanimation(pid 685 uid 1003)
+[pid=685][INFO][init_service.c:118]ServiceExec bootanimation
+```
+
+No `failed to enter sandbox`, no exit signal in the following 200 seconds.
+
+`render_service` still reports the old failure and never restarts:
+
+```
+[pid=3334][WARNING][init_common_service.c:418]Service warning -1 render_service, failed to enter sandbox.
+[pid=1][WARNING][init_signal_handler.c:43]Child process render_service(pid 3334) exit with signal : 11
+```
+
+Note that this entry is at t=306 s while the log runs to 515 s - `render_service` is not being
+restarted after it dies (its `critical` field is `[0, 5, 60]`).
+
+### AX.3 What is left
+
+`render_service` still segfaults.  The `sandbox: 0` fix removed one failure but not that one.
+The next step is to run `render_service` by hand from our init and capture its own stderr, or
+to disassemble it the way init was disassembled, looking for what it does first.
+
+`bootanimation` being alive is significant: it means the service layer now works end to end
+for at least one graphics-adjacent service.
+
+### AX.4 The state at the end of this session
+
+| layer | state |
+|---|---|
+| boot chain, super, dm, erofs, f2fs | working |
+| modules, GPU, DSI, SELinux | working |
+| private root, /system = our tree | working |
+| loader, devtmpfs, /etc, cgroups | working |
+| HarmonyOS init as PID 1 | **running** |
+| config parsing | **288 files** |
+| boot jobs | **19 finish** |
+| services exec'd | **yes** |
+| sandbox | **disabled for graphic.cfg; bootanimation now runs** |
+| render_service | **still SIGSEGV** |
+| display | not yet |
+
+Nine of the ten layers work.  The last one is a single binary that crashes on its own.
