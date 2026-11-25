@@ -4356,3 +4356,54 @@ milestone **cannot** bring up the display.  The graphics stack needs a kernel wi
 
 Ten of eleven layers work and are documented with evidence.  The eleventh requires building a
 kernel, which is a different project from the one that got us here.
+## Appendix BB - the entire GPU problem is one module: altmode-glink.ko
+
+### BB.1 The kallsyms census
+
+Reading `/proc/kallsyms` (18,529,444 bytes) inside the private root and searching for the
+symbols the graphics chain needs:
+
+```
+android_rvh_replace_next_task_fair_handler    hits=5      present
+__tracepoint_bw_hwmon_debug                   hits=4      present
+carveout_heap_add_memory                      hits=7      present
+adc_tm_channel_measure                        hits=5      present
+__devm_regmap_init_spmi_ext                   hits=5      present
+kgsl                                          hits=20265  present
+altmode_register_client                       hits=0      MISSING
+altmode_send_data                             hits=0      MISSING
+```
+
+**The kernel has almost everything.**  The vendor hooks are there, the tracepoints are there,
+the kgsl symbols are there.  Only the **altmode** family is absent.
+
+### BB.2 Why
+
+`altmode_register_client` and `altmode_send_data` are exported by **`altmode-glink.ko`**, which
+sits in the ramdisk at `/gpu/altmode-glink.ko` and is listed fifth in `/gpu/order.txt`.  It
+fails to load, so its exports never appear, so `msm_drm.ko` cannot resolve them and refuses to
+load, so no `/dev/dri` is created, so `render_service` segfaults.
+
+**One module is the whole GPU blocker.**
+
+### BB.3 What to do next
+
+1. load `altmode-glink.ko` by hand and capture its exact error (ENOENT vs ENOEXEC vs EINVAL);
+2. it depends on `pmic_glink.ko` and the glink transports, which are earlier in `order.txt` -
+   check whether those actually loaded before it was attempted;
+3. if `pmic_glink` is the one failing, load it first and retry the chain.
+
+### BB.4 The state at 113+ hours
+
+| layer | state |
+|---|---|
+| boot chain, filesystems, private root | working |
+| loader, devtmpfs, cgroups, SELinux | working |
+| HarmonyOS init as PID 1 | working |
+| 288 configs, 19 boot jobs, services | working |
+| sandbox | bypassed |
+| kernel symbols needed by the GPU stack | **present** |
+| altmode-glink.ko | **fails to load** |
+| everything above it (msm_drm, /dev/dri, render_service, display) | blocked by that one module |
+
+The project is now blocked on a single loadable module, not on architecture.
