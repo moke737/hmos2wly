@@ -4132,3 +4132,80 @@ for at least one graphics-adjacent service.
 | display | not yet |
 
 Nine of the ten layers work.  The last one is a single binary that crashes on its own.
+## Appendix AY - render_service segfaults because the GPU device nodes do not exist
+
+### AY.1 The probe
+
+Running `render_service` by hand from our init, with stdout/stderr captured:
+
+```
+=== /data/devcheck.txt ===
+/dev/mali0            access=-1
+/dev/dri/card0        access=-1
+/dev/dri/renderD128   access=-1
+/dev/dma_heap         access=-1
+/dev/dma_heap/system  access=-1
+/dev/kgsl-3d0         access=-1
+/dev/gpu              access=-1
+/dev/memcg/perf_sensitive/cgroup.procs  access=0
+/system/bin/render_service              access=0
+/system/lib64/chipset-pub-sdk/libhilog.so access=0
+/lib/ld-musl-aarch64.so.1               access=0
+
+=== /data/rs_status.txt ===
+waitpid=441 status=0xb exited=-1 sig=11
+
+=== /data/rs_err.txt ===
+HiLogAdapter_init: Can't connect to server. Errno: 2
+HiLogBase: Can't connect to server. Errno: 2   (repeated)
+```
+
+### AY.2 The conclusion
+
+**Every graphics device node is missing.**  `render_service` opens them during startup, gets
+ENOENT, and segfaults.  The error output confirms it gets far enough to initialise its hilog
+adapter and then dies.
+
+The cgroup path we fixed in Appendix AW is present (`access=0`), the binaries and libraries
+resolve, and the loader path is right.  Only the device nodes are absent.
+
+### AY.3 Why they are absent
+
+`devtmpfs` is a single shared kernel filesystem: mounting it in the new root shows exactly the
+nodes the kernel has created.  If `/dev/dri/card0`, `/dev/mali0` and `/dev/kgsl-3d0` are
+missing after mounting it, then the drivers that create them - `msm_drm`, `kgsl`, `qcom_dma_heap`,
+`msm_geni_serial` etc. - **are not loaded**.
+
+That matches what was recorded much earlier in this project: `msm_drm` failed to load with 14
+unresolved symbols (`altmode_*`, `dwc3_msm_set_dp_mode`, `fsa4480_*`, `hdcp1_*`, `hdcp2_*`,
+`mmrm_client_*`).  Those providers live in the vendor module set that our loader never managed
+to bring in.
+
+### AY.4 What to do next
+
+The GPU driver chain is the last missing piece.  Options:
+
+1. **load the dependency modules first** - `hdcp1`/`hdcp2`/`fsa4480`/`altmode`/`mmrm` providers
+   are in `vendor_boot`'s module set; loading them before `msm_drm` may resolve all 14 symbols;
+2. **check `/proc/kallsyms`** for each of the 14 missing symbols to confirm none of them exist
+   in the GKI kernel at all (some may need to come from `vendor_dlkm`);
+3. if `msm_drm` cannot be loaded, **look at whether `kgsl` alone creates `/dev/kgsl-3d0`** -
+   render_service needs at least one GPU node.
+
+### AY.5 The state at 108+ hours
+
+| layer | state |
+|---|---|
+| boot chain, super, dm, erofs, f2fs | working |
+| private root, /system, loader, devtmpfs, cgroups | working |
+| HarmonyOS init as PID 1 | running |
+| 288 configs parsed | yes |
+| 19 boot jobs | finish |
+| services exec'd | yes; bootanimation runs |
+| sandbox | disabled where needed |
+| **GPU device nodes** | **missing - drivers not loaded** |
+| render_service | SIGSEGV (consequence) |
+| display | not yet |
+
+The port now fails for exactly one reason: the graphics drivers are not in the kernel.  Every
+layer above the driver is correct and demonstrable.
