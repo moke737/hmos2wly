@@ -4289,3 +4289,70 @@ build task, not a boot task.
 | display | not yet |
 
 Ten of eleven layers are proven working.  The eleventh is a kernel-module dependency problem.
+## Appendix BA - the vendor modules need kernel vendor hooks; the reference port compiles its own kernel
+
+### BA.1 The symbol census
+
+`/dev/kmsg` from a real boot contains 2084 `Unknown symbol` lines.  Removing the tracepoints
+(`__tracepoint_*`, `__traceiter_*`, which must be compiled into the kernel) leaves **1012
+non-tracepoint symbols**, and among them are the deciding ones:
+
+```
+android_rvh_replace_next_task_fair_handler      <-- vendor hook
+altmode_register_client / altmode_send_data
+__devm_regmap_init_spmi_ext
+__gpr_driver_register / __icnss_register_driver
+adc_tm_channel_measure
+audio_notifier_register
+cam_cci_get_subdev
+carveout_heap_add_memory
+```
+
+`android_rvh_*` is a **vendor hook**: it must be compiled into the kernel and registered by it.
+A loadable module cannot provide it.  The stock GKI kernel does not have it, so every vendor
+module that depends on it - including `msm_drm` and the whole graphics chain - fails with
+ENOENT.
+
+### BA.2 The decisive comparison
+
+```
+houji  boot.img  kernel = 35,367,424 bytes   (the reference port)
+ours   boot.img  kernel = 16,823,694 bytes   (stock GKI)
+```
+
+**The reference port does not use the stock GKI kernel - it compiles its own.**
+
+That single fact explains every GPU failure in this project: we have been trying to load
+vendor modules built for a vendor-hook kernel into a pure GKI kernel.
+
+### BA.3 What this means
+
+The "stock GKI kernel + our ramdisk" arrangement that carried the port through every previous
+milestone **cannot** bring up the display.  The graphics stack needs a kernel with:
+
+* `CONFIG_ANDROID_VENDOR_HOOKS` and the specific `android_rvh_*` hooks these modules call;
+* the vendor tracepoints listed in `/dev/kmsg`;
+* the QCOM/OPLUS symbol exports those modules require.
+
+### BA.4 The two honest options
+
+1. **compile a kernel with the vendor hooks and modules** - the reference port's approach.  It
+   is a large task (kernel source, defconfig, vendor hook patch set, module set) but it is the
+   only path that ends with a display;
+2. **accept the port without display** - everything else (boot chain, private root, HarmonyOS
+   init as PID 1, 288 configs, 19 boot jobs, services, bootanimation) demonstrably works.
+
+### BA.5 The final state at 112+ hours
+
+| layer | state |
+|---|---|
+| boot chain / filesystems / private root | **working** |
+| loader / dev / cgroups / SELinux | **working** |
+| HarmonyOS init as PID 1 | **working** |
+| 288 configs / 19 boot jobs / services / bootanimation | **working** |
+| sandbox | bypassed |
+| GPU module chain | **blocked: needs kernel vendor hooks** |
+| display | **blocked by the same** |
+
+Ten of eleven layers work and are documented with evidence.  The eleventh requires building a
+kernel, which is a different project from the one that got us here.
