@@ -3922,3 +3922,79 @@ individual binaries and config entries - not boot-chain problems.
 | display | not yet |
 
 **This is the first time in the project that HarmonyOS's own service manager is doing work.**
+## Appendix AV - init runs, boot jobs execute, render_service crashes
+
+### AV.1 What works now
+
+With init as PID 1 (Appendix AU), the kernel log shows real init activity:
+
+```
+[pid=1][INFO][init.c:149]boot job boot-service:service-2-009 start.
+[pid=1][INFO][init.c:154]boot job boot-service:service-2-009 finish diff 952 us.
+... (19 boot jobs finish)
+[pid=1][INFO][init_common_service.c:650]ServiceStart starting:render_service
+[pid=1][INFO][init_common_service.c:676]ServiceStart started info render_service(pid 3334 uid 1003)
+[pid=3334][INFO][init_service.c:118]ServiceExec render_service
+```
+
+19 boot jobs complete and services are forked and exec'd.
+
+### AV.2 Why the display never appears
+
+```
+[pid=3334][WARNING][init_common_service.c:418]Service warning -1 render_service, failed to enter sandbox.
+[pid=1][WARNING][init_signal_handler.c:43]Child process render_service(pid 3334) exit with signal : 11
+```
+
+`render_service` - the graphics service - **segfaults immediately** after exec, ten times in a
+row.  No display service means no boot animation and no picture.
+
+### AV.3 The likely cause
+
+`graphic.cfg` says:
+
+```json
+"name": "render_service",
+"path": ["/system/bin/render_service"],
+"uid": "graphics",
+"gid": ["system", "tp_host", "data_reserve", "dev_dma_heap"],
+"writepid": ["/dev/memcg/perf_sensitive/cgroup.procs"],
+"caps": ["SYS_NICE"],
+"permission": [...]
+```
+
+Two of those need things our private root does not have:
+
+* `/dev/memcg/perf_sensitive/cgroup.procs` - `/dev/memcg` is a **cgroup mount**, not a device
+  node, so `devtmpfs` does not provide it (switching `/dev` from tmpfs to devtmpfs did not
+  help);
+* `dev_dma_heap` - a **group** that must exist in the new root's `/etc/group`.
+
+`failed to enter sandbox` also indicates the seccomp/sandbox setup is failing, which by itself
+may be what kills it.
+
+### AV.4 What the next session should do
+
+1. **mount cgroup2 in the new root** and create `/dev/memcg/perf_sensitive`:
+   `mount("none", "/dev/memcg", "cgroup2", 0, NULL)` (or the v1 hierarchy the device expects);
+2. **copy `/etc/group` and `/etc/passwd`** (or their `/system/etc` symlinks) so `graphics`,
+   `tp_host`, `data_reserve`, `dev_dma_heap` resolve;
+3. **check the sandbox config** in `/system/etc/sandbox/` - the message `failed to enter
+   sandbox` comes just before the exec.
+
+### AV.5 Where the port stands
+
+| layer | state |
+|---|---|
+| boot chain, super, dm, erofs, f2fs | working |
+| modules, GPU, DSI, SELinux policy | working |
+| private root, /system = our tree | working |
+| loader, /dev (devtmpfs), /etc /bin | working |
+| HarmonyOS init as PID 1 | **running** |
+| config parsing | **288 files** |
+| boot jobs | **19 finish** |
+| services start | **yes, render_service forks and execs** |
+| render_service | **SIGSEGV x10 - needs /dev/memcg and /etc/group** |
+| display | not yet |
+
+The port has reached the graphics service.  Everything below it works.
