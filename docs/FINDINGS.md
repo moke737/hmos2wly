@@ -1,4 +1,4 @@
-# Engineering log — porting hmos2sweet to the OnePlus 10 Pro
+﻿# Engineering log — porting hmos2sweet to the OnePlus 10 Pro
 
 > This is the raw working log kept during the port (in Chinese, as it was written
 > day by day). It contains the full measurement record: boot-chain analysis, the
@@ -5368,3 +5368,235 @@ bootanimation) would proceed.  The next person should concentrate on why the sam
 from the init context and fails from the samgr process - likely process credentials
 (uid 5555 vs root), the binder device the process actually opens, or SELinux's
 `binder_set_context_mgr` hook.
+---
+
+## Appendix BP. Two working reference ports found; the boot chain was rebuilt around HarmonyOS 6
+
+After 64 hours of debugging the HarmonyOS 5 (houji) donor it became clear the port could not
+progress inside that donor's init design.  Two **working** reference ports were found, and the
+whole boot chain was rebuilt around the second one.  This appendix records what they do, what
+was acquired, and the root cause that was finally identified.
+
+### BP.1 The `set context fail!` blocker is solved
+
+Earlier the direct-started `samgr` reported `SAMGR: set context fail!`.  The cause was ordering,
+not credentials: the process opened `/dev/binder` **before the driver was ready** (the first
+successful `binder_open` in the log appears about 12 s later).  Fix: poll until
+`open("/dev/binder")` succeeds and `BINDER_VERSION` returns 8, then drop to uid/gid 5555
+(`setgroups` with the cfg's `samgr,system,readproc` groups) and exec the pristine `samgr.real`.
+
+Result: `SAMGR: set context fail!` disappears and the `regObject=null` count drops from 15,677
+to 13,380 (about 15% of clients now reach the registry).  `SAMGR: set samgr ready ret : failed`
+remains, because `bootevent.samgr.ready` is owned by `samgr:samgr:0775` and the parameter service
+rejects the write with `error:107 with only add mode`.
+
+### BP.2 Reference port 1 - hmos2sweet (Redmi Note 10 Pro, SM7150)
+
+Repository already in the workspace (`hmos2sweet2/`).  Its `docs/PATCHES.md` lists 40 patches;
+the decisive ones for this project are:
+
+```
+10-display         replaces Huawei's display HALs with a DRM/KMS composer + dma-buf allocator
+                   "Without it there is no picture"
+11-gpu-mesa        Mesa 26 (freedreno on kgsl) instead of Huawei's Maleoon driver
+15-no-crash-reboot HarmonyOS reboots when SceneBoard crashes 4 times; clear the critical
+                   flags in ams_service_config.json
+16-performance     same family of HAL/ABI fixes
+30-remoteproc      qrtr/rmtfs/tqftpserv/pd-mapper - Android-only daemons the modem needs
+37-kirin-daemons   disable 25 Kirin-only vendor daemons (each burns 5 s at boot)
+41-chipset-vsync   replace libchipset_vsync so render_service stops polling a Kirin service
+```
+
+The display composer there is about **8.8k lines of C++** (14 files) and talks plain DRM, so it
+is portable; the GPU side is a Mesa freedreno platform patch.
+
+Its `docs/TROUBLESHOOTING.md` is worth reading before any display work:
+
+```
+Black from the start        -> look for "can not pick a crtc" / "skip connector" in kmsg
+Black after boot animation  -> SceneBoard loops with "GetDefaultDisplaySync: Get display
+                               info failed"; the composer must create a single display id 0
+```
+
+### BP.3 Reference port 2 - Janlaywss/SM-G986N-Rom-Space (Galaxy S20+, SM8250)
+
+This one **works**: HarmonyOS 6 boots to the desktop on a Qualcomm SM8250 device, WLAN works,
+settings open, only some rendering noise remains.  It is also the same architecture family as
+the SM8450, so its method applies directly.
+
+Repository: `https://github.com/Janlaywss/SM-G986N-Rom-Space`
+Cloned to `/root/sm986n`.  Key material:
+
+```
+docs/HARMONYOS_6_A25_RUNNING.md          the working version ("can enter the desktop")
+docs/HARMONYOS_6_MATE80_PRO_MAX.md       49 KB full log
+docs/HARMONYOS_6_A26_DISPLAY.md          display polish, how the composer was validated
+docs/ROM_DOWNLOADS.md                    every URL and SHA-256 used
+patches/harmonyos6/preinit_loop.c        420 lines - the whole loop boot design
+patches/harmonyos6/display/              585 lines - display adapter (composer_c_bridge,
+                                         y2q_buffer_vdi, legacy_0.h, pixel_formats.h)
+patches/harmonyos6/local_desktop_init.c  107 lines - the desktop bring-up
+patches/harmonyos6/userauth_empty_test_backend.cpp  78 lines - lock screen without TEE
+patches/harmonyos6/probes/drm_scanout.c  72 lines - verify the panel without eyes
+scripts/build_harmonyos6_composer.sh     how the composer is built
+```
+
+Its architecture, which this project now follows:
+
+```
+physical partitions are never rewritten
+  donor images live as FILES on the real userdata partition
+  /data/harmonyos6/donor/system.img      ro  -> loop0 -> /usr
+  /data/harmonyos6/donor/vendor.img      ro  -> loop1 -> /vendor
+  /data/harmonyos6/donor/chip_prod.img   ro  -> loop2 -> /chip_prod
+  /data/harmonyos6/donor/sys_prod.img    ro  -> loop3 -> /sys_prod
+  /data/harmonyos6/donor/cust.img        ro  -> loop4 -> /cust
+  /data/harmonyos6/data.img              rw  -> loop5 -> /data
+  /data/harmonyos6/metadata.img          rw  -> loop6 -> /metadata
+  preinit writes /etc/fstab.required, then execs /bin/init_early
+  a 300 s capture harness collects kmsg/processes/params/mounts, then returns to recovery
+```
+
+Two lessons from its experiment log that would otherwise cost days:
+
+```
+A11-A12  the old HAL only supports mode 0 but the composer enumerated every mode
+A13      the allocator failed to export PRIME buffers from card0 (no master permission)
+         -> use renderD128 first
+A29      black 64-byte-aligned segments on the panel were a kernel cache-coherency bug in
+         msm_gem get_pages() (NULL device dma sync -> dummy_dma_ops); patch
+         0006-msm-gem-flush-new-pages.patch
+```
+
+### BP.4 HarmonyOS 6 donor acquired and verified
+
+```
+device    Mate 80 Pro Max, SGT-AL10 / SGT-AL10Q
+version   HarmonyOS 6.0.0.125(SP8), SGT-LGRP3-CHN 206.0.0.125(SP8)
+url       https://update.dbankcdn.com/download/data/pub_13/HWHOTA_hota_900_9/20/v3/
+          5uiI74q1Q82Lj7JpfMx_pQ/full/update_full_base.zip
+size      15,739,729,680 bytes
+sha256    eafb3820421e327a30c3a9fc6e8461500e15a39c1625c46a4c312e5f43fb7801   MATCHES
+```
+
+Downloaded with a 12-way parallel range fetcher (`pdl.py`, 16 MiB chunks): the single-stream
+curl managed 1.7 MB/s (14 hours), the parallel one 21 MB/s (27 minutes).
+
+`update.bin` inside the OTA is a custom container whose header at 0xb0 holds a 64-entry
+component table (87 bytes per entry: name[32], ..., size at 47, sha256 at 55).  All eight
+components this project needs verified against their SHA-256:
+
+```
+package_info      101 B          boot        48,234,496 B
+ramdisk         4,194,304 B      system   3,985,268,736 B
+chip_prod   3,111,424,000 B      sys_prod 5,940,019,200 B
+vendor        999,186,432 B      cust         6,275,072 B
+```
+
+The donor `ramdisk.img` uses a Huawei container: `HARMONY!` magic, then a 0x800-byte header
+(0x40 holds `buildvariant=user`), then a **gzip stream at 0x800**.  After skipping the header
+and gunzipping, the cpio holds exactly what the reference preinit needs:
+
+```
+/init -> bin/init_early          292,568 bytes
+bin/init_early                   the HarmonyOS 6 first-stage init
+bin/toybox, bin/sh               the shell the init spawns
+lib/ld-musl-aarch64.so.1         loader
+etc/ld-musl-aarch64.path/.ini    namespace config
+lib64/libsepol.z.so, libload_policy.z.so, libinit_stub_empty.so
+```
+
+### BP.5 ROOT CAUSE: the Qualcomm UFS driver is a module, so no block device ever appears
+
+This is the finding that explains every silent hang in the loop bring-up.
+
+```
+$ grep CONFIG_SCSI_UFS out/.config
+CONFIG_SCSI_UFSHCD=y
+CONFIG_SCSI_UFSHCD_PCI=y
+CONFIG_SCSI_UFSHCD_PLATFORM=y
+# CONFIG_SCSI_UFS_QCOM is not set        <-- the Qualcomm UFS glue is a MODULE
+```
+
+With no `ufs_qcom.ko` loaded, **no block device exists at all**:
+
+```
+find_part("userdata") fails  ->  recovery() is taken  ->  the phone sits at the OnePlus logo
+```
+
+and because `/data` cannot be mounted, the capture harness never writes a single byte, which is
+why the loop bring-up produced no logs while the old (real-partition) bring-up did.
+
+Two confusions this also cleared:
+
+```
+1. logdump (/dev/block/sde66) is written by a ColorOS/Android service, not by the kernel.
+   Every time it was read from TWRP it contained the PREVIOUS ANDROID boot, never ours.
+   Reading it therefore proved nothing and repeatedly showed stale SAMGR lines.
+2. CONFIG_SCSI_UFSHCD being =y only brings up the generic UFS core; the Qualcomm
+   platform driver is what actually probes the host controller.
+```
+
+The module lives in the `vendor_boot_a` ramdisk (22.6 MB).  Its header is:
+
+```
+magic VNDRBOOT, header_version 4, page_size 4096
+vendor_ramdisk_size  22,603,396
+header_size          2128
+ramdisk start        0x1000, cpio magic at 0x1009
+```
+
+That cpio is **not** plain newc: the bytes after the 6-byte magic are scrambled by a
+Huawei/OnePlus private scheme, so it cannot be walked directly.  Do not spend time on the
+container - the same modules are in the ROM:
+
+```
+/vendor/lib/modules/ufs_qcom.ko   (inside vendor.img, EROFS)
+```
+
+The OTA's own filelist also lists a `/fw_ufsdev` component (1,023,140 bytes) which is the UFS
+device firmware, not the driver.
+
+### BP.6 What is on the phone right now
+
+```
+/data/harmonyos6/donor/system.img     3,985,268,736 B
+/data/harmonyos6/donor/vendor.img       999,186,432 B
+/data/harmonyos6/donor/chip_prod.img  3,111,424,000 B
+/data/harmonyos6/donor/sys_prod.img   5,940,019,200 B
+/data/harmonyos6/donor/cust.img           6,275,072 B
+/data/harmonyos6/data.img             8,589,934,592 B   ext4
+/data/harmonyos6/metadata.img            67,108,864 B   ext4
+```
+
+`boot_h6loop.img` (stock gzip kernel + 192 MiB padding) carries: `/init` = our adaptation of
+the reference `preinit_loop.c`, plus `/bin/init_early`, `/bin/toybox`, `/bin/sh`, the musl
+loader and its libs from the HarmonyOS 6 donor ramdisk.
+
+The preinit was changed only where this device differs:
+
+```
+partition lookup    PARTNAME scan of /sys/class/block instead of hardcoded /dev/sda37|sda32
+no cache partition  mount userdata as /hostdata, bind /hostdata/logs onto /h6cache
+loop sources        donor/{system,vendor,chip_prod,sys_prod,cust}.img + data.img + metadata.img
+recovery()          writes boot-recovery into misc, then PARKS instead of rebooting
+                    (LINUX_REBOOT_CMD_RESTART2 "recovery" loops into the system on this
+                    bootloader, which is what caused the earlier reboot loops)
+PID guard           logs the real pid to /dev/kmsg before anything else and parks if not 1
+```
+
+### BP.7 Next step
+
+Load `ufs_qcom.ko` (and its clock/regulator/interconnect dependencies) from `/vendor/lib/modules`
+in the ROM, put them in our ramdisk, and `finit_module` them as the very first action of the
+preinit.  Once a block device exists the whole chain already built in BP.6 should proceed:
+loop attach, `fstab.required`, `init_early`, and then the HarmonyOS 6 service chain.
+
+```
+extract:   fsck.erofs --extract=DIR vendor.img   ->  DIR/lib/modules/ufs_qcom.ko
+carry:     copy the module set into the ramdisk under /mods/
+load:      finit_module() each in dependency order before find_part("userdata")
+```
+
+Nothing else in the chain is unproven: loop mounting, the fstab format, and `init_early` are all
+taken verbatim from a port that boots to the desktop on the same vendor.
