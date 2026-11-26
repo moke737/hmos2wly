@@ -4970,3 +4970,76 @@ finally execute `/system/bin/samgr` itself.
 
 Everything that was blocking the display has been fixed except samgr itself, and the stand-in
 that was silently replacing it has now been deleted.
+## Appendix BJ - the boot chain finally runs the init: gzip + 192 MiB padding
+
+### BJ.1 Three independent bugs were hiding the init
+
+| # | bug | symptom | fix |
+|---|---|---|---|
+| 1 | `boot.img` kernel must be **gzip** | bootloader could not load our raw `Image` | use `arch/arm64/boot/Image.gz` |
+| 2 | the image must be **exactly 192 MiB** (= the boot partition) | bootloader fell back, never used our ramdisk | `truncate -s 201326592` |
+| 3 | `/system/bin/samgr` was a **stand-in ELF** that exec'd `samgr.real`/`/data/samgr.bin` and exited 255 | samgr never ran | bind-mount the pristine binary from the OH `system.img` |
+
+After all three, the init finally executed and logged:
+
+```
+OHOS-STAGE[1] A: load_modules
+OHOS-STAGE[1] B: load_gpu_modules
+OHOS-STAGE[1] C: overlay_init_dir
+OHOS-STAGE[1] G: pristine_samgr done
+OHOS-STAGE[1] E: before switch_to_our_root
+OHOS-STAGE[1] F: after switch_to_our_root
+```
+
+`pristine_samgr.txt` on /data:
+
+```
+src=/cfgs/samgr dst_access=0 bind=0 errno=0
+```
+
+### BJ.2 The binder ioctls work
+
+A probe executed from the init as PID 1 with the **stock** kernel:
+
+```
+OHOS-BPROBE open=4 errno=0
+OHOS-BPROBE VERSION r=0 proto=8 errno=0
+OHOS-BPROBE SET_CTX_MGR_EXT r=0 errno=0     <- what samgr uses
+OHOS-BPROBE SET_CTX_MGR     r=-1 errno=16   <- EBUSY, already set: correct
+```
+
+So `BINDER_SET_CONTEXT_MGR_EXT` works on the stock kernel; the kernel is not the problem,
+and our own kernel build turned out not to boot at all (stuck at the OnePlus logo even with
+the stock ramdisk), so the stock kernel stayed.
+
+### BJ.3 What samgr is actually stuck on
+
+Wrapping samgr in a shell script that redirects its output to `/data/samgr.err` gave 5.3 MB of:
+
+```
+HiLogAdapter_init: Can't connect to server. Errno: 2
+HiLogBase: Can't connect to server. Errno: 2      (117870 times)
+...
+HiLogBase: Can't connect to server. Errno: 13
+```
+
+`errno 2` = ENOENT, then `errno 13` = EACCES on `/dev/unix/socket/hilogInput`.
+`hilogd.cfg` declares that socket with `permissions: 0666`, and SELinux is permissive, yet the
+connect still fails.  **samgr spins in this HiLogBase retry loop and never reaches
+`set samgr ready`, so no context manager is registered, so every client gets
+`regObject=null` and the display never comes up.**
+
+That is the exact remaining item.
+
+### BJ.4 Service numbers with the working boot chain
+
+```
+samgr          started=1  reaped=0    (alive)
+hilogd         started=1  reaped=0
+bootanimation  started=1  reaped=0
+foundation     started=17 reaped=17
+render_service started=10 reaped=10
+806 ServiceStart lines
+binder transaction failures: 160 -> 40
+SAMGR regObject=null: 27251 -> 9078
+```
