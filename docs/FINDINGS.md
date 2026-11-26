@@ -5122,3 +5122,57 @@ as uid 5555 cannot reach the socket that `hilogd` (uid 1036) bound.
 | display | not yet |
 
 The one missing piece is the hilog socket handshake.  Everything upstream of it is proven.
+## Appendix BL - the hilog socket exists, samgr just cannot see it
+
+### BL.1 Direct observation of the socket directory
+
+A survivor process forked after `switch_to_our_root()` dumped the real state of the socket
+directory every 2 s into `/data/sockets.txt`:
+
+```
+--- tick 3 ---
+  /dev/unix                      mode=0755 uid=0    gid=0
+  /dev/unix/socket               mode=0755 uid=0    gid=0
+  /dev/unix/socket/hilogInput    mode=0222 uid=1036 gid=1007
+  /dev/unix/socket/hilogControl  mode=0660 uid=1036 gid=1007
+  dir: . .. hilogOutput hilogControl hilogControlPub hilogInput CJAppSpawn
+       file_migrate_ability NativeSpawn paramservice PropBridge
+       init_control_fd fd_holder
+```
+
+So the socket **does exist** and is reachable from the init's namespace, with mode `0222`
+(the configured `0666` was not applied, but `0222` still grants write to "other").
+
+The socket path used by the clients is confirmed from the shipped libraries:
+
+```
+/dev/unix/socket/hilogInput
+/dev/unix/socket/hilogControlPub
+```
+
+and `samgr` links `libhilog.so`.
+
+### BL.2 The contradiction
+
+samgr (uid 5555) reports `ENOENT` and then `EACCES` on that exact path while the socket is
+present with world-writable permissions, and `samgr` never enters its sandbox
+(`Sandbox system has not been created`), so it should share the init's mount namespace.
+
+The only consistent explanation left is that samgr resolves `/dev` through a different mount,
+i.e. HarmonyOS init's namespace handling for services (`begot`) diverges from the `/dev` that
+our own init set up before handing over.
+
+### BL.3 The state of the port, precisely
+
+```
+boot image      gzip kernel + 192 MiB + tail      correct
+init            runs, switch_root ok              verified (6 STAGE markers)
+pristine samgr  bind-mounted, errno=0             verified
+hilogd ordering starts 5 s before samgr           verified (58.69s vs 63.73s)
+binder ioctls   SET_CONTEXT_MGR_EXT r=0           verified from PID 1
+hilog socket    exists, 0222, uid 1036            verified by direct stat
+samgr           cannot see it -> no context mgr   NOT solved
+display         n/a until samgr works             -
+```
+
+Everything except the namespace question has been measured directly.
