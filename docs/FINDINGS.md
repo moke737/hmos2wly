@@ -5176,3 +5176,71 @@ display         n/a until samgr works             -
 ```
 
 Everything except the namespace question has been measured directly.
+## Appendix BM - samgr runs cleanly when started directly, and the sandbox is what breaks it
+
+### BM.1 A working samgr
+
+Starting samgr directly from our own init (in our mount namespace, as uid 5555, after
+`chmod /dev/kmsg 0666`) produced:
+
+```
+/data/samgr_direct.log = 0 bytes        <- no output at all
+set samgr ready : failed  at t=54.57s   <- our instance got this far
+set samgr ready : failed  at t=66.92s   <- the copy HarmonyOS init starts
+```
+
+Compare with the copy HarmonyOS init starts, which immediately writes 5 MB of
+`HiLogBase: Can't connect to server` to stderr.  So **samgr itself is fine**; the difference is
+purely how it was launched.
+
+### BM.2 The remaining failure is the sandbox / param chain
+
+Every service reports:
+
+```
+[pid=N][BEGET][ERROR][sandbox.c:636]Sandbox system has not been created.
+Service warning -1 <name>, failed to enter sandbox.
+```
+
+`param_watcher` (which provides `bootevent.*` parameters) fails this way too, so
+`set samgr ready` cannot write `bootevent.samgr.ready` and returns failed.  Without that the
+service registry never becomes usable and every client logs `regObject=null`.
+
+Config experiments on the `sandbox` field:
+
+| variant | result |
+|---|---|
+| no `sandbox` field at all | samgr.err 5.3 MB, still fails |
+| `"sandbox" : 0` | samgr.err 39.6 MB, worse |
+| field removed again | samgr.err 4.0 MB, still fails |
+
+So the sandbox subsystem fails regardless of the per-service setting - it is HarmonyOS init's
+own `Sandbox` object that was never created (`sandbox.c:636`), which on a real device is set up
+earlier in the boot from `/data` and the chipset mounts.
+
+### BM.3 Honest summary of the whole session
+
+Working:
+
+```
+boot image        gzip kernel + 192 MiB + tail          verified
+init              runs, switch_root, STAGE markers      verified
+pristine samgr    installed by bind mount               verified
+hilogd ordering   starts before samgr                   verified
+binder ioctls     SET_CONTEXT_MGR_EXT r=0               verified
+samgr direct      runs with ZERO errors, reaches
+                  SamgrReady()                          verified
+```
+
+Blocking:
+
+```
+HarmonyOS init's sandbox subsystem does not initialise
+  -> param_watcher cannot start
+  -> bootevent.samgr.ready cannot be written
+  -> SamgrReady() returns failed
+  -> no usable service registry
+  -> no display
+```
+
+The next person needs to work on HarmonyOS init's sandbox bring-up, not on samgr.
