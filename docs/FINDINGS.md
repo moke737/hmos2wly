@@ -5043,3 +5043,82 @@ render_service started=10 reaped=10
 binder transaction failures: 160 -> 40
 SAMGR regObject=null: 27251 -> 9078
 ```
+## Appendix BK - samgr still blocks on the hilog socket
+
+### BK.1 What was fixed and verified
+
+The boot chain now reaches HarmonyOS init reliably:
+
+```
+OHOS-STAGE[1] A: load_modules
+OHOS-STAGE[1] B: load_gpu_modules
+OHOS-STAGE[1] C: overlay_init_dir
+OHOS-STAGE[1] G: pristine_samgr done            (src=/cfgs/samgr bind=0 errno=0)
+OHOS-STAGE[1] E: before switch_to_our_root
+OHOS-STAGE[1] F: after switch_to_our_root
+```
+
+The binder kernel interface is verified good from PID 1 with the stock kernel:
+
+```
+OHOS-BPROBE open=4 errno=0
+OHOS-BPROBE VERSION r=0 proto=8 errno=0
+OHOS-BPROBE SET_CTX_MGR_EXT r=0 errno=0
+OHOS-BPROBE SET_CTX_MGR     r=-1 errno=16   (EBUSY: already set)
+```
+
+The pristine `hilogd.cfg` restored the missing `pre-init` job, and hilogd now starts before samgr:
+
+```
+t=58.69s  ServiceStart started info hilogd(pid 544 uid 1036)
+t=63.73s  ServiceStart started info samgr(pid 558 uid 5555)
+```
+
+### BK.2 What still fails
+
+`samgr` immediately writes 5.3 MB to stderr:
+
+```
+HiLogAdapter_init: Can't connect to server. Errno: 2     (ENOENT)
+HiLogBase: Can't connect to server. Errno: 2             x117870
+...
+HiLogBase: Can't connect to server. Errno: 13            (EACCES)
+```
+
+and then:
+
+```
+SAMGR: set samgr ready ret : failed
+```
+
+which in turn means no binder context manager, `regObject=null` for every client
+(15682 occurrences), and no display.  `render_service` dies with SIGSEGV and `foundation`
+with SIGKILL.
+
+### BK.3 Everything that was tried on this one item
+
+1. chmod 0666 of `/dev/unix/socket/hilogInput` from a background helper
+2. starting hilogd early from our init (before HarmonyOS init)
+3. starting it after `switch_to_our_root()`
+4. a persistent keeper that re-creates the socket and restarts hilogd
+5. restoring the pristine `hilogd.cfg` (with `"sandbox": 0` only)
+6. removing every one of our own hilog touches again
+
+None changed the result.  The remaining unknown is how HarmonyOS init creates and mounts
+`/dev/unix/socket` relative to the `/dev` that our own init mounts, and why a process running
+as uid 5555 cannot reach the socket that `hilogd` (uid 1036) bound.
+
+### BK.4 The state of the port
+
+| layer | state |
+|---|---|
+| boot image (gzip kernel + 192 MiB + tail) | correct |
+| HarmonyOS init as PID 1 | runs through switch_root |
+| pristine samgr installed by bind mount | yes, errno=0 |
+| hilogd ordering | fixed, starts 5 s before samgr |
+| binder ioctls (`SET_CONTEXT_MGR_EXT`, tokens) | verified working |
+| services | ~512-806 ServiceStart |
+| **hilog socket reachable from samgr** | **NO - the single remaining blocker** |
+| display | not yet |
+
+The one missing piece is the hilog socket handshake.  Everything upstream of it is proven.
