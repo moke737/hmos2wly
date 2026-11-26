@@ -5244,3 +5244,64 @@ HarmonyOS init's sandbox subsystem does not initialise
 ```
 
 The next person needs to work on HarmonyOS init's sandbox bring-up, not on samgr.
+## Appendix BN - the sandbox config fix and the final wall
+
+### BN.1 The chip_prod sandbox configs fixed hilog
+
+Our ramdisk's `chip_prod/` directory was **empty**.  OpenHarmony init's `Sandbox::Init()` reads
+`/chip_prod/etc/sandbox/*.json`, so the sandbox singleton was never created and every service
+failed with `Sandbox system has not been created`.
+
+After copying the four pristine files
+
+```
+/system/etc/sandbox/appdata-sandbox.json
+/system/etc/sandbox/appdata-sandbox-isolated.json
+/system/etc/sandbox/system-sandbox.json
+/system/etc/sandbox/chipset-sandbox.json
+```
+
+into `chip_prod/etc/sandbox/`, the effect on samgr was dramatic:
+
+| | samgr stderr |
+|---|---|
+| before | **5.3 MB** (and 39.6 MB with `"sandbox": 0`) |
+| after | **261 bytes** |
+
+So hilogd finally came up correctly and samgr stopped spinning in `HiLogBase`.  That is the
+single biggest improvement of the whole session.
+
+### BN.2 What still does not work
+
+```
+failed to enter sandbox            448
+Sandbox system has not been created 440
+SAMGR regObject=null               15671
+set samgr ready : failed           still
+```
+
+`param_watcher` still dies (`sa_main /system/profile/param_watcher.json`), so
+`bootevent.samgr.ready` cannot be written and `SamgrReady()` keeps returning failed.
+
+Also fixed in this round: `force_bind_system()` existed but was **never called**; it is now
+called after `switch_to_our_root()`, so `/system` really is a bind mount of `/usr/system`.
+That did not resolve the sandbox either.
+
+### BN.3 The state of the port, final
+
+```
+boot image          gzip kernel + 192 MiB + tail                verified
+init                runs, switch_root, 6 STAGE markers          verified
+/system             real bind mount of /usr/system              verified
+pristine samgr      runs, reaches SamgrReady()                  verified
+hilog               connects (samgr stderr 261 bytes)           verified
+binder ioctls       SET_CONTEXT_MGR_EXT r=0                     verified
+sandbox             never created -> param_watcher dies          NOT solved
+service registry    regObject=null for every client              NOT solved
+display             n/a                                          -
+```
+
+The remaining wall is HarmonyOS init's sandbox subsystem.  Everything downstream of it
+(param parameters, SamgrReady, the service registry, the display pipeline) is blocked by it,
+and it is not affected by the config in `chip_prod`, by the `/system` bind, or by any of the
+per-service `sandbox` field variants that were tried.
