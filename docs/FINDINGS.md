@@ -5305,3 +5305,66 @@ The remaining wall is HarmonyOS init's sandbox subsystem.  Everything downstream
 (param parameters, SamgrReady, the service registry, the display pipeline) is blocked by it,
 and it is not affected by the config in `chip_prod`, by the `/system` bind, or by any of the
 per-service `sandbox` field variants that were tried.
+## Appendix BO - the two definitive findings: "set context fail!" and the param directory
+
+### BO.1 samgr's own diagnosis, finally
+
+Reading samgr's own stdout gave the real sequence:
+
+```
+SAMGR: main called, enter System Ability Manager
+SAMGR: InitProfile spend 64ms
+SAMGR: System Ability Manager enter init
+SAMGR: set context fail!                 <-- THE REAL FAILURE
+SAMGR: set samgr ready ret : failed
+SAMGR: JoinWorkThread error, samgr main exit!
+```
+
+`set context fail!` is `IPCProcessSkeleton::SetIPCContextManager()` returning false, i.e. the
+`BINDER_SET_CONTEXT_MGR_EXT` ioctl failed **inside the samgr process**.  A probe run from the
+init as PID 1 (root) on the same `/dev/binder` node returned `r=0 errno=0`, so the ioctl itself
+and the device are fine - only the samgr process cannot do it.  This is the single failure that
+produces `regObject=null` for every client and therefore no display.
+
+### BO.2 /dev/__parameters__ must be a directory
+
+The AVC audit log exposed the shape of the parameter area:
+
+```
+avc: denied { getattr } for pid=1 comm="init"
+     path="/dev/__parameters__/param_sec_dac" dev="rootfs"
+```
+
+Our init was creating `/dev/__parameters__` as a plain file.  After changing it to a directory
+containing `param_sec_dac` and `param_selinux`, clients genuinely start reading it:
+
+```
+render_service:     open /dev/__parameters__/param_selinux  dev="tmpfs"
+deviceauth_service: open /dev/__parameters__/param_selinux  dev="tmpfs"
+sa_main:            open /dev/__parameters__/param_selinux  dev="tmpfs"
+```
+
+Also learned: the parameter service itself runs inside init (PID 1), and the boot-event writes
+report `Set param 'bootevent.*' error:107 with only add mode`.
+
+### BO.3 Final state
+
+```
+boot image            gzip + 192 MiB + tail                        correct
+init                  runs, 6 STAGE markers                        verified
+/system               bind of /usr/system                          verified
+/dev/__parameters__   directory with dac files, clients read it    fixed
+chip_prod sandbox     configs installed, samgr stderr 5.3MB->261B  fixed
+hilogd ordering       starts before samgr                          fixed
+binder ioctl (init)   SET_CONTEXT_MGR_EXT r=0                      verified
+binder ioctl (samgr)  "set context fail!"                          NOT solved
+service registry      regObject=null everywhere                    blocked by the above
+display               n/a                                          -
+```
+
+The whole port is one ioctl away: if `samgr` could set the binder context manager, the registry
+would come up and the display services already running (render_service, foundation,
+bootanimation) would proceed.  The next person should concentrate on why the same ioctl works
+from the init context and fails from the samgr process - likely process credentials
+(uid 5555 vs root), the binder device the process actually opens, or SELinux's
+`binder_set_context_mgr` hook.
