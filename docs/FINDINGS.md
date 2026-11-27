@@ -5600,3 +5600,213 @@ load:      finit_module() each in dependency order before find_part("userdata")
 
 Nothing else in the chain is unproven: loop mounting, the fstab format, and `init_early` are all
 taken verbatim from a port that boots to the desktop on the same vendor.
+
+---
+
+## Appendix BQ. The one thing that was never solved: no observable log channel
+
+This appendix records everything learned while trying to get the HarmonyOS loop boot to
+produce any output at all.  It ends with the phone needing service, so it is written as a
+handover: what works, what does not, and exactly where the wall was.
+
+### BQ.1 The boot image rules, now confirmed by experiment
+
+```
+1. keep the 182 MB AVB tail
+   bootimg4.py pack ... --keep-tail
+   Without it the bootloader rejects boot_a and the phone sits at the OnePlus logo
+   forever, so the kernel never runs.  This was the cause of every "stuck at logo"
+   in the previous 90 hours.
+
+2. the ramdisk must fit beside that tail
+   partition = 201,326,592 bytes (192 MiB)
+   tail      = 182,403,072 bytes
+   header    =       1,584 bytes
+   kernel    =  16,823,694 bytes
+   -> ramdisk <=  2,098,242 bytes
+   gzip got to 2,092,206 (fits); zstd got to 1,947,141 (fits); xz got smallest but
+   CONFIG_RD_XZ is not set in this kernel.  CONFIG_RD_GZIP / LZ4 / ZSTD are set.
+
+3. `fastboot boot <img>` works and is far safer than flashing
+   It boots the image without touching slot state, so a bad build costs one reboot
+   instead of a slot-retry-count.  Use it for every experiment.
+
+4. yes, our init really does run
+   With a 2,240-byte statically linked /init that only parks, `fastboot boot` leaves
+   the phone at the logo and it never falls back to fastboot.  With the stock kernel
+   in boot_a and a broken super, the phone falls to fastboot within 30 s.  That
+   difference is the proof that our /init executes.
+```
+
+### BQ.2 The stock boot ramdisk is not stock
+
+`E:\1+10pro\_fishan155\images\boot.img` is a **KernelSU-patched** image.  Its ramdisk is
+LZ4 and contains:
+
+```
+/init                423,240   a wrapper
+/init.real         3,263,568   the real Android init
+/kernelsu.ko         384,664   KernelSU kernel module
+/system/etc/ramdisk/build.prop
+/debug_ramdisk  /dev  /metadata  /mnt  /proc  /second_stage_resources  /sys
+```
+
+Replacing `/init` with our own program is enough to run our code; `init.real` and
+`kernelsu.ko` can be dropped, which is also how the ramdisk stays under 2.09 MB.
+
+### BQ.3 vendor_boot is where the kernel modules live
+
+```
+vendor_boot.img        201,326,592 bytes
+magic                  VNDRBOOT, header_version 4, page_size 4096
+vendor_ramdisk_size    22,603,396
+header_size            2,128
+ramdisk offset         0x1000
+ramdisk format         LZ4 legacy (magic 02 21 4c 18) -> 74,802,944 byte newc cpio
+```
+
+Contents after extraction:
+
+```
+avb/                    AVB public keys
+first_stage_ramdisk/fstab.qcom
+lib/modules/            467 modules, including ufs_qcom.ko
+system/bin/             e2fsck, linker64, snapuserd
+system/lib64/           Android libs
+```
+
+There is **no `/init`** in the vendor ramdisk, so the first-stage init comes from the boot
+ramdisk and the modules come from the vendor ramdisk.  Both must be in place; that is why
+the very first loop bring-up had no block devices: the kernel was running our init from
+boot but nothing had loaded `ufs_qcom.ko`.
+
+### BQ.4 The OTA, and the exact super partition sizes
+
+OTA: `ColorOS NE2210_16.0.3.530(CN01).zip`, 7,476,990,622 bytes, A/B payload OTA.
+
+The payload header is **not** the naive layout.  Parsing it as
+`magic(4) + version(8) + manifest_size(8) + manifest` starting the manifest at offset 20
+produces "field number 0 is illegal"; the manifest actually starts at **offset 24**:
+
+```python
+f.seek(24); manifest = f.read(275472)
+from payload_dumper import update_metadata_pb2 as pb
+m = pb.DeltaArchiveManifest(); m.ParseFromString(manifest)
+```
+
+The manifest carries `dynamic_partition_metadata` with the sizes Android expects:
+
+```
+group qti_dynamic_partitions  size 11,270,094,848
+
+my_stock      4,138,418,176      odm          1,300,738,048
+my_product    1,243,275,264      system         984,440,832
+system_ext      899,432,448      vendor         676,937,728
+vendor_dlkm     162,013,184      product          9,203,712
+odm_dlkm            348,160
+
+plus physical partitions: boot 201,326,592 / vendor_boot 201,326,592 /
+recovery 104,857,600 / dtbo 25,165,824 / modem 286,117,888 / dsp 67,108,864
+```
+
+`payload_dumper` writes exactly the images whose sizes match these numbers, so the sizes
+and the images are consistent.
+
+### BQ.5 The super rebuild still fails: "Could not open super partition"
+
+The sequence tried, in order:
+
+```
+fastboot erase super                                  OKAY
+fastboot reboot fastboot                              fastbootd starts (is-userspace: yes)
+fastboot create-logical-partition system 984440832    FAILED
+    remote: 'Could not open super partition'
+
+fastboot flash super super_empty.img (from E:\1+10pro\_twrp)   OKAY
+  -> super offset 0    = 67 44 6c 61  ("gDla", LP geometry magic)   verified
+  -> super offset 4096 = 30 50 4c 41  ("0PLA", LP header magic)     verified
+  -> create-logical-partition still FAILED with the same message
+
+built a fresh super_empty with the OTA's group/size, flashed it, same result.
+```
+
+So the metadata is genuinely on the partition and the magics are right, yet fastbootd
+still refuses to open it.  The remaining suspects, for whoever picks this up:
+
+```
+1. the geometry checksum or metadata_slot_count must match what this bootloader expects
+   (the _twrp image reports metadata_slot_count = 3, AOSP normally uses 2)
+2. fastbootd validates the LP metadata against a super partition size it reads from the
+   GPT, and that read is what fails, not the metadata
+3. the device may need a full `super.img` (metadata + all extents pre-reserved) written
+   as one image rather than an empty metadata blob
+```
+
+Building a full `super.img` needs `lpmake` (AOSP `system/extras/partition_tools`), which is
+not available here; a hand-written liblp builder was used instead and could not get past
+this point.
+
+### BQ.6 Why the port cannot continue on this phone
+
+The port itself does not need Android.  It needs our init to load `ufs_qcom.ko`, mount
+userdata, attach the loop images and exec `init_early`.  The blocker is that **every log
+channel on this device is dead during a custom boot**:
+
+```
+logdump (/dev/block/sde66, 512 MB)
+    written only by a ColorOS userspace service.  Across a dozen custom boots the
+    newest timestamp never changed: it always held the previous Android boot.
+logfs  (/dev/block/sde65, 8 MB)
+    a FAT12 volume whose root contains only the volume label "LOGFS".  Empty.
+pstore
+    mounted but empty: ramoops is not registered by this kernel/cmdline.
+/data
+    needs UFS, which is exactly what we are trying to bring up.
+misc
+    needs a block device to write to.
+screen
+    needs the display drivers, also modules.
+EDL / 9008
+    fused.  QFIL and MSM Download Tool cannot be used.
+```
+
+Without a way to observe a failed boot, iterating on the init is blind.  The reference port
+that this project followed (Janlaywss/SM-G986N-Rom-Space) could iterate because its device
+boots Android normally and provides `adb shell` as an observation channel.
+
+### BQ.7 State of the phone at handover
+
+```
+boot_a          ColorOS 16.0.3.530 boot.img        (stock, from the OTA)
+vendor_boot_a   ColorOS 16.0.3.530 vendor_boot.img (stock)
+dtbo_a          stock
+vbmeta_a / _system / _vendor                      stock signature
+recovery_a      stock recovery (TWRP overwritten back)
+misc            erased
+super           11,274,289,152 bytes, contains a valid-looking LP metadata
+                (geometry magic at 0, header magic at 4096) that fastbootd rejects
+userdata        formatted f2fs, 229 GB, empty
+metadata        formatted ext4
+current-slot    a
+slot-successful:a  no
+bootloader      unlocked, secure=yes
+symptom         power on -> OnePlus logo -> fastboot within ~30 s
+```
+
+The phone is **not hard-bricked**: fastboot, fastbootd and TWRP all work.  It needs a super
+partition rebuilt by a tool that is not EDL and not plain fastbootd.
+
+### BQ.8 What is actually needed to try again
+
+```
+1. a phone that boots Android, so `adb shell` gives an observation channel
+2. `fastboot boot` for every experiment, never `flash boot_a`
+3. /init replaced in the BOOT ramdisk (<= 2.09 MB, gzip, tail kept)
+4. a preinit whose first action is finit_module on
+   /lib/modules/ufs_qcom.ko (+ phy-qcom-ufs, clk-qcom, clk-rpmh, gcc-waipio,
+   cmd-db, qcom_rpmh, rpmh-regulator, icc-rpmh, qnoc-waipio, tmecom-intf),
+   because CONFIG_SCSI_UFS_QCOM is not in the GKI kernel
+5. only then mount userdata, attach the loop images and exec init_early
+```
+
+Steps 1 and 2 are the ones that cost 220 hours here.
