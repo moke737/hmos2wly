@@ -5810,3 +5810,289 @@ partition rebuilt by a tool that is not EDL and not plain fastbootd.
 ```
 
 Steps 1 and 2 are the ones that cost 220 hours here.
+
+---
+
+## Appendix BR. The per-slot vbmeta is what blocked every custom image, and the reference architecture is now fully reproduced
+
+Written after a full day (2026-11-28) of work that started with the phone restored to Android,
+continued through a complete reference-aligned bring-up attempt, and ended with the phone
+restored again.  This appendix supersedes the "no observable log channel" conclusion of BQ:
+there IS a log channel, and the real blocker was never the ramdisk size or the AVB tail.
+
+### BR.1 The decisive find: OnePlus uses per-slot vbmeta partitions
+
+The single most important discovery of the whole project:
+
+```
+vbmeta             (unsuffixed, what everyone flashes)
+vbmeta_a           vbmeta_b
+vbmeta_system      vbmeta_system_a    vbmeta_system_b
+vbmeta_vendor      vbmeta_vendor_a    vbmeta_vendor_b
+```
+
+Flashing only the unsuffixed `vbmeta` has **no effect on the boot decision**.  The bootloader
+validates the active slot against `vbmeta_<slot>`.  While that partition carries the stock
+signed image (verification on), every unsigned image is rejected:
+
+```
+fastboot boot <custom>.img
+  Sending 'boot.img' ... OKAY
+  Booting FAILED (remote: 'Failed to load/authenticate boot image: Load Error')
+```
+
+and a flashed custom `boot_a` never boots: the bootloader marks the slot unbootable and drops
+straight back to fastboot.
+
+The fix is a vbmeta with verification disabled, written to **all nine** partitions:
+
+```sh
+python3 avbtool.py make_vbmeta_image --flags 2 --padding_size 65536 \
+        --output vbmeta_disabled.img          # Flags: 2, Algorithm: NONE
+
+for p in vbmeta vbmeta_a vbmeta_b \
+         vbmeta_system vbmeta_system_a vbmeta_system_b \
+         vbmeta_vendor vbmeta_vendor_a vbmeta_vendor_b; do
+    fastboot flash $p vbmeta_disabled.img
+done
+```
+
+After that, both `fastboot boot <custom>.img` and a flashed `boot_a` are accepted.  This was
+verified four independent ways (tiny probe, preinit image, TWRP, stock chain).
+
+Consequence for the reference port: this device's working setup had a KernelSU-patched
+(unsigned) boot image, so its per-slot vbmeta must already have been disabled.  Any future
+bring-up must keep it that way.
+
+### BR.2 A/B recovery: the recovery image has no kernel
+
+`bootimg4.py unpack` of the TWRP image reports:
+
+```
+kernel   0 -> kernel            (zero bytes!)
+ramdisk  66179710 -> ramdisk.gz
+tail     38670336 -> tail.bin
+```
+
+On this device `recovery_a` is a **ramdisk-only** image.  The bootloader composes a recovery
+boot from `boot_<slot>`'s kernel and `recovery_<slot>`'s ramdisk.  Therefore:
+
+```
+fastboot flash boot_a TWRP.img     # WRONG: removes the only kernel
+fastboot reboot                    # nothing boots, back to fastboot
+
+fastboot flash boot_a stock_boot.img   # kernel
+fastboot flash recovery_a TWRP.img     # ramdisk
+fastboot reboot recovery               # TWRP runs, adb state "recovery"
+```
+
+This explained several hours of "TWRP suddenly does not boot anymore".
+
+### BR.3 Slot state after a failed boot
+
+Every failed boot sets `slot-unbootable:<slot> = yes`.  While it is set, the bootloader skips
+that slot entirely and lands in fastboot within ~10 s.  `fastboot set_active <slot>` clears it,
+and it must be issued again **immediately before** the reboot under test:
+
+```
+fastboot getvar slot-unbootable:a      -> yes    (skip, fastboot)
+fastboot set_active a                  -> no
+fastboot reboot                        -> the slot is actually tried
+```
+
+`fastboot -w` is not usable here: the bundled mke2fs is missing and fastboot aborts with
+`CreateProcess failed ... Cannot generate image for userdata`.  Android itself re-formats and
+re-encrypts an unusable userdata on the next boot, which worked fine.
+
+### BR.4 Restoring Android to a usable state (verified procedure)
+
+The phone was restored twice with exactly this sequence:
+
+```
+# 1. stock boot chain matching the installed system (ColorOS 17 / Android 16, "fishan155")
+fastboot flash boot_a        boot.img
+fastboot flash vendor_boot_a vendor_boot.img
+fastboot flash dtbo_a        dtbo.img
+fastboot flash recovery_a    recovery.img
+
+# 2. verification disabled on every vbmeta partition (needed because the boot image is
+#    KernelSU-patched / unsigned) - see BR.1
+for p in vbmeta vbmeta_a vbmeta_b vbmeta_system{,a,b} vbmeta_vendor{,a,b}; do
+    fastboot flash $p vbmeta_disabled.img
+done
+
+fastboot set_active a
+fastboot erase misc
+fastboot reboot
+```
+
+Result: `sys.boot_completed=1`, `/data` re-encrypted (224 GB, ~3 % used), ColorOS first-boot
+wizard on screen, charging.  No loss of the `super` contents.
+
+Mixing versions breaks boot: OTA 16.0.3.530 boot/vendor_boot/dtbo against a ColorOS 17 system
+gives a phone that never leaves the OnePlus logo.
+
+### BR.5 The reference port, reconstructed exactly
+
+Janlaywss/SM-G986N-Rom-Space (GitHub, plus its upstream `tsryzenstech/hmos2sweet`, fixed
+revision `1be080c3`) does **not** run HarmonyOS inside Android.  The mechanism is:
+
+```
+boot.img ramdisk:
+  /init                 custom C program (preinit_loop.c, ~500-800 lines)
+  /h6-scanout           helper
+  /h6-local-desktop     helper
+  /hostdata /h6cache    empty dirs
+
+preinit_loop at boot:
+  1. mount /proc /sys /dev (devtmpfs)
+  2. load every module from /lib/modules/modules.load, in order
+     (the vendor_boot ramdisk supplies /lib/modules on GKI devices)
+  3. find userdata through /sys/class/block (no ueventd yet), mount it on /hostdata
+     choose a log dir: cache partition if present, otherwise <userdata>/logs -> /h6cache
+  4. attach the donor images as loop devices, all from <userdata>/hmos/:
+        loop0 system.img   -> /usr       (erofs, ro)
+        loop1 vendor.img   -> /vendor    (erofs, ro)
+        loop2 chipprod.img -> /chip_prod (erofs, ro)
+        loop3 sysprod.img  -> /sys_prod  (erofs, ro)
+        loop4 cust.img     -> /cust      (erofs, ro)
+        loop5 data.img     -> /data      (ext4, rw)
+        loop6 metadata.img -> /metadata  (ext4, rw)
+  5. write /etc/fstab.required with exactly those seven lines, and link it to
+     /system/etc/fstab.required
+  6. exec /system/bin/init  ->  the HarmonyOS init, running as the REAL PID 1
+     (this is why the reference port needs no PID-namespace tricks)
+  7. a forked capture harness samples /proc, /dev/kmsg and `hilog` for 300 s, writes
+     everything under /h6cache/harmonyos6/, then arms the misc partition with
+     "boot-recovery" so the next reboot lands in TWRP
+```
+
+Their kernel is LineageOS msm-4.19 built with EROFS, **PID/USER namespaces, devtmpfs,
+access_token_id, Binder sender info, FS_VERITY**, plus hmos2sweet's access-token/Binder/fork
+patches and an async Binder sender-PID patch.  Their data partition is plain f2fs (no
+Android encryption), which is why the loop mount works.
+
+Artifacts on this machine: the adapted `preinit_loop_negroni.c` (783 lines, adds
+`load_from_modules_load()`, misc/logdump breadcrumbs, "park instead of reboot" on failure),
+the OH image set (system 2.95 GiB, vendor 642 MiB, sysprod 1.70 GiB, chipprod 544 MiB,
+cust 6 MiB, data 8 GiB, metadata 64 MiB), and a working pack pipeline
+(stock kernel + custom ramdisk + 182 MiB AVB tail, 199.6 MB / 201.3 MB).
+
+### BR.6 Running the HarmonyOS init inside Android (what actually happens)
+
+Before the reference architecture was reproduced, the OH init was run as a normal process in
+a chroot inside Android.  Measured with a hand-written ptrace supervisor:
+
+```
+1. the init aborts unless it runs as uid 0; its own message is
+   "Current process uid is not root, exit."
+   It does NOT require pid 1.  (musl's getpid() is inlined, so a ptrace scan
+   finds no getpid syscall at all.)
+
+2. /dev/bbox must exist and answer a SetBootStage ioctl.  On this phone the bbox
+   kernel driver does not exist; with a plain file the ioctl fails with ENOTTY and
+   the init logs
+     "[bootfail]SetBootStage ioctl failed, errorNo: 25:Not a tty"
+   then calls exit_group(0) and is gone.  Faking that single ioctl to 0 with ptrace
+   (or with a seccomp filter that returns ERRNO(0) for ioctl) is enough for the
+   init to continue.
+
+3. with the ioctl faked and getpid() preloaded to return 1, the init ran 33 178
+   syscalls in 15 s without exiting: it enumerates /sys/devices/... (DDR, dcvs,
+   UCSI, PCIe, coresight, regulator trees) exactly like ueventd plus a boot
+   detector.  Under ptrace the enumeration is ~1000x slower, so a 15 s run only
+   reaches the first few hundred sysfs nodes.
+
+4. hilogd and samgr DO run inside Android when started with the OH loader and a
+   library path that includes every subdirectory of /system/lib64:
+     LD_LIBRARY_PATH=/system/lib:/system/lib64/platformsdk:/system/lib64/chipset-pub-sdk:
+       /system/lib64/chipset-sdk:/system/lib64/ndk:/system/lib64/module:
+       /system/lib64/media:/system/lib64/appspawn:/system/lib64/graphics3d:
+       /system/lib64/init:/system/lib64/extensionability:... lib64
+     LD_PRELOAD is not needed for those.
+   hilogd must start first (it creates /dev/unix/socket/hilogInput); samgr then
+   connects.  With that ordering both stay silent and alive.
+
+5. that gave the first real HarmonyOS log of the project: 28 060 lines of hilog.
+   The only recurring error is the param subsystem refusing SELinux access:
+     E C02C02/PARAM [param_base.c:356] Forbid to open workspace for u:object_r:default_param:s0 error 2
+     E C02C02/PARAM [param_base.c:530] Selinux check name persist.time.timezone ... failed!
+   i.e. the parameter service (which normally lives inside init) never came up, so
+   every client fails to open /dev/__parameters__/<context>.
+
+6. running the OH init as root inside Android is dangerous.  It has no /dev/block in
+   the chroot, but earlier variants did: an unhardened run left the phone in an
+   infinite reboot loop and corrupted the boot state badly enough that both slots
+   had to be re-flagged bootable.  A supervisor must at minimum block
+     reboot, kexec_load, init_module, finit_module, delete_module, swapon,
+     settimeofday, clock_settime, sethostname, acct, ptrace,
+     kill/tkill/tgkill/pidfd_send_signal, setns, mknodat,
+     open_by_handle_at/name_to_handle_at, process_vm_readv/writev,
+     sched_setscheduler/sched_setattr/setpriority/sched_setaffinity
+   and it must run in a private mount namespace.
+```
+
+### BR.7 Still unresolved
+
+1. **Does a custom `/init` in a custom boot.img actually execute on this phone?**
+   Custom images are accepted and the phone sits at the OnePlus logo for the whole test
+   window (280-300 s, no fallback to fastboot), which earlier was read as "the init is
+   running".  But every breadcrumb channel stayed empty: no `MSTAGE` records written into
+   misc at offset 0x8000, no `/data/logs/hmos`, no `HSTAGE` in the logdump tail, for
+   TWRP-ramdisk, uncompressed-cpio, lz4, preinit and 3.6 KB raw-syscall probe alike.
+   A kernel that panics because it cannot find `/init` hangs in exactly the same way.
+   The boot header was compared field by field against the stock image and is identical
+   apart from `ramdisk_size`.  The next step is a probe whose only job is to write a
+   marker to misc and to a raw partition, to decide between "init runs" and "init never
+   runs".
+
+2. **Custom kernel.**  The stock GKI 5.10 kernel of this device has
+   `# CONFIG_PID_NS is not set` and no access_token/binder extensions.  The reference port
+   needed a kernel built for its device with EROFS, PID/USER namespaces, devtmpfs,
+   access_token_id, Binder sender info and FS_VERITY, plus hmos2sweet's patches.  For
+   SM8450 that means a LineageOS sm8450 base at a pinned revision, the same patch set
+   forward-ported to 5.10, and the OnePlus dtbo/dtbo handling.  Their patch files are
+   archived at `sm986n/patches/harmonyos6/` (0001 access-token binder reference,
+   0002 access-token c89, 0003 dma-buf name double lock, 0004 drm native display master,
+   0005 codesign ecdsa backport, 0006 msm gem flush new pages, 0007 proc dsmm developer).
+
+3. **Display HAL.**  The reference port wrote an 8769-line display composition HAL and
+   several display-mode/backlight patches for Qualcomm msm_drm.  Without an equivalent the
+   phone can boot HarmonyOS services but will not show a HarmonyOS picture.
+
+### BR.8 Practical notes that cost hours and are easy to forget
+
+```
+* after every failed boot: fastboot getvar slot-unbootable:<slot>, then set_active
+* recovery = boot kernel + recovery ramdisk (BR.2); never flash TWRP into boot
+* fastboot boot <img> is safe (no slot state change) and is the right way to test
+* fastboot flash <slot>_boot leaves slot-unbootable set on failure
+* /data as plain f2fs destroys Android (it re-formats on next boot and loses the images);
+  the HarmonyOS images must be re-pushed afterwards
+* TWRP reading /data requires only `mount -t f2fs /dev/block/by-name/userdata /data`
+* misc offset 0x8000 is a usable breadcrumb scratch area (TWRP-readable);
+  the logdump tail (offset 500 MiB) is also readable but a failed write is silent
+* a vbmeta with Flags: 2 and Algorithm: NONE is accepted and disables verification;
+  padding it to 64 KiB matches the partition size
+* the phone survives everything as long as fastboot works: every state above was
+  recovered without QFIL/EDL
+```
+
+### BR.9 Where the port stands
+
+```
+done:   reference architecture reconstructed and the preinit written for SM8450
+        (module loading from modules.load, userdata mount, 7 loop images, fstab,
+         exec of the OH init, 300 s capture, misc-armed failure path)
+done:   image set staged (14.5 GiB), /data formatted plain f2fs, working boot.img pack
+done:   per-slot vbmeta solved; custom images are accepted by the bootloader
+done:   HarmonyOS hilogd + samgr run inside Android; real hilog captured
+open:   prove a custom /init executes (BR.7.1) - the immediate blocker
+open:   custom kernel with PID/access_token support (BR.7.2)
+open:   display HAL (BR.7.3)
+```
+
+Estimated remaining effort, based on the reference port's own timeline (10 days to first
+setup wizard on a Qualcomm device with an easier starting point): 3-6 weeks of focused work
+for this phone to reach a HarmonyOS desktop.  The infrastructure built today removes most
+of the repeated guesswork; what remains is kernel and HAL work rather than trial and error.
